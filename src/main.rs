@@ -17,8 +17,10 @@
 use csd_swarm::acquire::{acquire, candidate_urls};
 use csd_swarm::chain::Chain;
 use csd_swarm::gateway::{router, GwState};
+use csd_swarm::p2p::{self, Cmd};
 use csd_swarm::store::Store;
 use std::time::Duration;
+use tokio::sync::{mpsc, oneshot};
 
 fn env(k: &str, d: &str) -> String {
     std::env::var(k).unwrap_or_else(|_| d.to_string())
@@ -39,6 +41,12 @@ async fn main() -> anyhow::Result<()> {
         .unwrap_or(2 * 1024 * 1024);
     let confirmations: u64 = env("CSD_CONFIRMATIONS", "3").parse().unwrap_or(3);
     let poll = Duration::from_secs(env("CSD_POLL_SECS", "30").parse().unwrap_or(30));
+    let p2p_listen = env("CSD_P2P_LISTEN", "/ip4/0.0.0.0/tcp/0");
+    let bootstrap: Vec<String> = env("CSD_P2P_BOOTSTRAP", "")
+        .split(',')
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect();
 
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(20))
@@ -48,36 +56,76 @@ async fn main() -> anyhow::Result<()> {
 
     tracing::info!(%rpc, %origin, %listen, store=%store_dir, max_bytes, confirmations, "csd-swarm starting ({} already pinned)", store.count().await);
 
+    // ── p2p task: serve Have/Get + announce held hashes + satisfy Want from peers ──
+    let (cmd_tx, cmd_rx) = mpsc::channel::<Cmd>(64);
+    {
+        let store = store.clone();
+        let listen_ma = p2p_listen
+            .parse()
+            .expect("CSD_P2P_LISTEN must be a multiaddr");
+        let boot: Vec<_> = bootstrap.iter().filter_map(|s| s.parse().ok()).collect();
+        tokio::spawn(async move {
+            if let Err(e) = p2p::run(store, listen_ma, boot, max_bytes, cmd_rx, None).await {
+                tracing::error!("p2p task exited: {e}");
+            }
+        });
+    }
+
     // ── ingest loop: pin every confirmed Propose payload, acquiring+verifying what we lack ──
     {
         let store = store.clone();
         let client = client.clone();
         let origin = origin.clone();
+        let cmd_tx = cmd_tx.clone();
         tokio::spawn(async move {
             loop {
                 match chain.confirmed_pins(confirmations, 200).await {
                     Ok(pins) => {
-                        let (mut fetched, mut failed, mut held) = (0u64, 0u64, 0u64);
+                        let (mut fetched, mut from_peer, mut failed, mut held) =
+                            (0u64, 0u64, 0u64, 0u64);
                         for p in &pins {
                             if store.has(&p.payload_hash).await.is_some() {
                                 held += 1;
                                 continue;
                             }
+                            // 1) try the content origin (verified in acquire)
                             let urls = candidate_urls(&origin, &p.payload_hash, &p.uri);
-                            match acquire(&client, &p.payload_hash, &urls, max_bytes).await {
-                                Ok(bytes) => match store.put(&p.payload_hash, &bytes).await {
+                            let mut bytes = acquire(&client, &p.payload_hash, &urls, max_bytes)
+                                .await
+                                .ok();
+                            let mut via_peer = false;
+                            // 2) origin miss → ask peers (p2p verifies sha256 before returning)
+                            if bytes.is_none() {
+                                let (tx, rx) = oneshot::channel();
+                                if cmd_tx
+                                    .send(Cmd::Want(p.payload_hash.clone(), tx))
+                                    .await
+                                    .is_ok()
+                                {
+                                    if let Ok(Some(b)) = rx.await {
+                                        bytes = Some(b);
+                                        via_peer = true;
+                                    }
+                                }
+                            }
+                            match bytes {
+                                Some(b) => match store.put(&p.payload_hash, &b).await {
                                     Ok(()) => {
-                                        fetched += 1;
-                                        tracing::info!(hash=%p.payload_hash, len=bytes.len(), "pinned");
+                                        if via_peer {
+                                            from_peer += 1;
+                                        } else {
+                                            fetched += 1;
+                                        }
+                                        tracing::info!(hash=%p.payload_hash, len=b.len(), via_peer, "pinned");
                                     }
                                     Err(e) => {
                                         failed += 1;
                                         tracing::warn!(hash=%p.payload_hash, "store failed: {e}");
                                     }
                                 },
-                                Err(e) => {
+                                None => {
                                     failed += 1;
-                                    tracing::debug!(hash=%p.payload_hash, "acquire failed: {e}");
+                                    tracing::debug!(hash=%p.payload_hash, "unavailable (origin + peers)");
                                 }
                             }
                         }
@@ -85,6 +133,7 @@ async fn main() -> anyhow::Result<()> {
                             pins = pins.len(),
                             held,
                             fetched,
+                            from_peer,
                             failed,
                             "ingest pass complete"
                         );

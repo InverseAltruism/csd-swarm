@@ -22,6 +22,7 @@ anyhow = "1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 futures-util = "0.3"
+libp2p = { version = "0.54", features = ["tokio", "tcp", "noise", "yamux", "gossipsub", "request-response", "cbor", "identify", "ping", "macros"] }
 
 [profile.release]
 opt-level = 2
