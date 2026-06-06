@@ -53,6 +53,19 @@ fn norm(hash: &str) -> String {
     hash.strip_prefix("0x").unwrap_or(hash).to_lowercase()
 }
 
+/// The anti-poisoning gate for peer-served bytes: accept a Get response ONLY if it carries bytes
+/// that are within the size cap AND whose sha256 equals the hash we asked for. A peer that lies
+/// (wrong bytes, oversized, or doesn't actually hold it) gets rejected — it can never poison us.
+pub fn accept_get(want_hash: &str, resp: Resp, max_bytes: usize) -> Option<Vec<u8>> {
+    let want = norm(want_hash);
+    match resp {
+        Resp::Get(Some(bytes)) if bytes.len() <= max_bytes && sha256_hex(&bytes) == want => {
+            Some(bytes)
+        }
+        _ => None,
+    }
+}
+
 /// Announce the hashes we hold over gossipsub (newline-joined hex) so peers learn who-has.
 fn publish_held(
     swarm: &mut libp2p::Swarm<Behaviour>,
@@ -171,11 +184,7 @@ pub async fn run(
                     }
                     request_response::Message::Response { request_id, response } => {
                         if let Some((want, reply)) = pending.remove(&request_id) {
-                            let out = match response {
-                                Resp::Get(Some(bytes)) if bytes.len() <= max_bytes && sha256_hex(&bytes) == want => Some(bytes),
-                                _ => None, // wrong bytes / oversize / not held → reject (no poisoning)
-                            };
-                            let _ = reply.send(out);
+                            let _ = reply.send(accept_get(&want, response, max_bytes));
                         }
                     }
                 },
@@ -185,5 +194,37 @@ pub async fn run(
                 _ => {}
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    const GOOD: &[u8] = b"{\"v\":1}";
+    #[test]
+    fn accept_get_is_the_anti_poisoning_gate() {
+        let h = sha256_hex(GOOD);
+        // correct, in-size bytes → accepted (0x-prefixed want also works)
+        assert_eq!(
+            accept_get(&h, Resp::Get(Some(GOOD.to_vec())), 1 << 20),
+            Some(GOOD.to_vec())
+        );
+        assert_eq!(
+            accept_get(&format!("0x{h}"), Resp::Get(Some(GOOD.to_vec())), 1 << 20),
+            Some(GOOD.to_vec())
+        );
+        // a LYING peer: wrong bytes for the requested hash → rejected
+        assert_eq!(
+            accept_get(&h, Resp::Get(Some(b"TAMPERED".to_vec())), 1 << 20),
+            None
+        );
+        // oversized → rejected
+        assert_eq!(accept_get(&h, Resp::Get(Some(GOOD.to_vec())), 3), None);
+        // peer doesn't hold it / wrong variant → rejected
+        assert_eq!(accept_get(&h, Resp::Get(None), 1 << 20), None);
+        assert_eq!(
+            accept_get(&h, Resp::Have { has: true, len: 9 }, 1 << 20),
+            None
+        );
     }
 }

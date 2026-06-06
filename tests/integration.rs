@@ -139,3 +139,26 @@ async fn gateway_self_certifies_and_handles_errors() {
         .unwrap();
     assert_eq!(health["pinned"], 1);
 }
+
+#[tokio::test]
+async fn gateway_refuses_to_serve_corrupted_store_bytes() {
+    // simulate a corrupted store: bytes filed under a hash they do NOT match.
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(dir.path()).await.unwrap();
+    let wrong_key = "ab".repeat(32); // != sha256(GOOD)
+    assert_ne!(sha256_hex(GOOD), wrong_key);
+    store.put(&wrong_key, GOOD).await.unwrap();
+    let gw = spawn(router(GwState {
+        store,
+        max_bytes: 1 << 20,
+    }))
+    .await;
+    let client = reqwest::Client::new();
+    // gateway self-check: served body must hash to the requested hash → corrupted entry → 500, never served
+    let r = client
+        .get(format!("{gw}/content/0x{wrong_key}"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 500);
+}
