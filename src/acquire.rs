@@ -117,13 +117,18 @@ async fn fetch_capped(client: &reqwest::Client, url: &str, max_bytes: usize) -> 
     Ok(out)
 }
 
-/// Candidate URLs for a (hash, uri): the configured origin's convention endpoint first, then the
-/// on-chain `uri` if it is itself an http(s) URL (an origin hint for other apps).
-pub fn candidate_urls(origin: &str, hash: &str, uri: &str) -> Vec<String> {
-    // the origin is operator-configured (trusted) — used verbatim. The on-chain uri hint is
-    // attacker-controlled, so it is only used if it points at a PUBLIC host (SSRF guard).
+/// Candidate URLs for a (hash, uri): the configured origin's convention endpoint first, then —
+/// only if `follow_uri_hints` is enabled — the on-chain `uri` if it's an http(s) URL.
+pub fn candidate_urls(origin: &str, hash: &str, uri: &str, follow_uri_hints: bool) -> Vec<String> {
+    // The origin is operator-configured (trusted) — used verbatim. The on-chain uri hint is
+    // ATTACKER-controlled: even with the SSRF host guard, fetching it connects the operator's node
+    // to an attacker server (IP leak / deanonymization / per-hash tracking), so it is OFF by
+    // default. When enabled, it's still only used for a PUBLIC host.
     let mut v = vec![format!("{}/content/{}", origin.trim_end_matches('/'), hash)];
-    if (uri.starts_with("http://") || uri.starts_with("https://")) && host_is_public(uri) {
+    if follow_uri_hints
+        && (uri.starts_with("http://") || uri.starts_with("https://"))
+        && host_is_public(uri)
+    {
         v.push(uri.to_string());
     }
     v
@@ -141,16 +146,27 @@ mod tests {
         );
     }
     #[test]
-    fn candidate_urls_origin_first_then_http_uri() {
-        let v = candidate_urls(
+    fn candidate_urls_origin_first_then_opt_in_http_uri() {
+        // uri hints are OFF by default → only the origin is a candidate
+        let off = candidate_urls(
             "http://o:7777/",
             "0xabc",
             "https://obs.example.com/payload/9",
+            false,
         );
-        assert_eq!(v[0], "http://o:7777/content/0xabc");
-        assert_eq!(v[1], "https://obs.example.com/payload/9");
-        // opaque (non-http) uri is NOT used as a fetch url
-        let v2 = candidate_urls("http://o", "0xabc", "cairn:v1:deadbeef");
+        assert_eq!(off.len(), 1);
+        assert_eq!(off[0], "http://o:7777/content/0xabc");
+        // when explicitly enabled, a PUBLIC http uri is appended after the origin
+        let on = candidate_urls(
+            "http://o:7777/",
+            "0xabc",
+            "https://obs.example.com/payload/9",
+            true,
+        );
+        assert_eq!(on[0], "http://o:7777/content/0xabc");
+        assert_eq!(on[1], "https://obs.example.com/payload/9");
+        // opaque (non-http) uri is NOT used as a fetch url even when enabled
+        let v2 = candidate_urls("http://o", "0xabc", "cairn:v1:deadbeef", true);
         assert_eq!(v2.len(), 1);
     }
 
@@ -171,7 +187,8 @@ mod tests {
             "gopher://x/y",
         ] {
             assert!(!host_is_public(bad), "{bad} must be rejected");
-            let v = candidate_urls("http://origin:7777", "0xabc", bad);
+            // even with hints ENABLED, an internal uri is never a candidate (SSRF guard)
+            let v = candidate_urls("http://origin:7777", "0xabc", bad, true);
             assert_eq!(v.len(), 1, "internal uri {bad} must not become a candidate");
         }
         for good in [

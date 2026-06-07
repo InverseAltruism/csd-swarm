@@ -234,14 +234,19 @@ pub async fn run(
                 SwarmEvent::Behaviour(BehaviourEvent::Rr(request_response::Event::Message { message, .. })) => match message {
                     request_response::Message::Request { request, channel, .. } => {
                         let resp = match request {
-                            Req::Have(h) => { let n = norm(&h); Resp::Have { has: store.has(&n).await.is_some(), len: store.has(&n).await.unwrap_or(0) } }
-                            // serve only bytes we hold AND re-verify sha256==hash before handing
-                            // them to a peer, so a locally-tampered blob can't be propagated.
+                            Req::Have(h) => { let n = norm(&h); let has = !store.is_denied(&n).await && store.has(&n).await.is_some(); Resp::Have { has, len: if has { store.has(&n).await.unwrap_or(0) } else { 0 } } }
+                            // serve only bytes we hold, that aren't on the operator denylist, AND
+                            // re-verify sha256==hash — so a takedown also stops peer replication and
+                            // a locally-tampered blob can't be propagated.
                             Req::Get(h) => {
                                 let n = norm(&h);
-                                let ok = match store.get(&n).await {
-                                    Some(b) if crate::acquire::sha256_hex(&b) == n => Some(b),
-                                    _ => None,
+                                let ok = if store.is_denied(&n).await {
+                                    None
+                                } else {
+                                    match store.get(&n).await {
+                                        Some(b) if crate::acquire::sha256_hex(&b) == n => Some(b),
+                                        _ => None,
+                                    }
                                 };
                                 Resp::Get(ok)
                             }

@@ -10,23 +10,129 @@ use axum::{
     extract::{Path, State},
     http::{header, HeaderMap, StatusCode},
     response::{IntoResponse, Response},
-    routing::get,
+    routing::{delete, get, post},
     Json, Router,
 };
 use serde_json::json;
+use std::sync::Arc;
+use tokio::sync::Semaphore;
 
 #[derive(Clone)]
 pub struct GwState {
     pub store: Store,
     pub max_bytes: usize,
+    /// If set, the takedown API (DELETE /content/:hash, /admin/*) is enabled and requires this
+    /// bearer token. If None the API is disabled (returns 403) — content can't be removed over HTTP.
+    pub admin_token: Option<String>,
+    /// Bounds concurrent content reads so a flood of GET/Range can't blow up RAM/IO (each read
+    /// buffers up to one max-object, so peak ≈ permits × max_object).
+    pub conns: Arc<Semaphore>,
 }
 
 pub fn router(state: GwState) -> Router {
     Router::new()
         .route("/content/:hash", get(get_content).head(head_content))
+        // takedown: remove a blob AND block its re-download (admin-token gated)
+        .route("/content/:hash", delete(purge_content))
+        .route("/admin/deny/:hash", post(deny_content))
+        .route("/admin/allow/:hash", post(allow_content))
         .route("/pins", get(pins))
         .route("/health", get(health))
         .with_state(state)
+}
+
+/// Constant-time-ish bearer-token check for the admin endpoints.
+fn admin_ok(st: &GwState, headers: &HeaderMap) -> bool {
+    let Some(want) = st.admin_token.as_deref() else {
+        return false; // API disabled
+    };
+    let got = headers
+        .get(header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.strip_prefix("Bearer "))
+        .or_else(|| headers.get("x-admin-token").and_then(|v| v.to_str().ok()));
+    got.map(|g| g.as_bytes().ct_eq(want.as_bytes()))
+        .unwrap_or(false)
+}
+
+// minimal constant-time compare (avoid pulling a crate for one use)
+trait CtEq {
+    fn ct_eq(&self, other: &[u8]) -> bool;
+}
+impl CtEq for [u8] {
+    fn ct_eq(&self, other: &[u8]) -> bool {
+        if self.len() != other.len() {
+            return false;
+        }
+        let mut d = 0u8;
+        for (a, b) in self.iter().zip(other) {
+            d |= a ^ b;
+        }
+        d == 0
+    }
+}
+
+async fn purge_content(
+    State(st): State<GwState>,
+    headers: HeaderMap,
+    Path(hash): Path<String>,
+) -> Response {
+    if !admin_ok(&st, &headers) {
+        return (StatusCode::FORBIDDEN, "admin token required").into_response();
+    }
+    let Some(h) = norm(&hash) else {
+        return StatusCode::BAD_REQUEST.into_response();
+    };
+    match st.store.deny(&h).await {
+        Ok(purged) => (
+            StatusCode::OK,
+            Json(json!({ "ok": true, "denied": true, "purged": purged })),
+        )
+            .into_response(),
+        Err(e) => (StatusCode::BAD_REQUEST, e.to_string()).into_response(),
+    }
+}
+
+async fn deny_content(
+    State(st): State<GwState>,
+    headers: HeaderMap,
+    Path(hash): Path<String>,
+) -> Response {
+    if !admin_ok(&st, &headers) {
+        return (StatusCode::FORBIDDEN, "admin token required").into_response();
+    }
+    let Some(h) = norm(&hash) else {
+        return StatusCode::BAD_REQUEST.into_response();
+    };
+    match st.store.deny(&h).await {
+        Ok(purged) => (
+            StatusCode::OK,
+            Json(json!({ "ok": true, "denied": true, "purged": purged })),
+        )
+            .into_response(),
+        Err(e) => (StatusCode::BAD_REQUEST, e.to_string()).into_response(),
+    }
+}
+
+async fn allow_content(
+    State(st): State<GwState>,
+    headers: HeaderMap,
+    Path(hash): Path<String>,
+) -> Response {
+    if !admin_ok(&st, &headers) {
+        return (StatusCode::FORBIDDEN, "admin token required").into_response();
+    }
+    let Some(h) = norm(&hash) else {
+        return StatusCode::BAD_REQUEST.into_response();
+    };
+    match st.store.allow(&h).await {
+        Ok(removed) => (
+            StatusCode::OK,
+            Json(json!({ "ok": true, "removed": removed })),
+        )
+            .into_response(),
+        Err(e) => (StatusCode::BAD_REQUEST, e.to_string()).into_response(),
+    }
 }
 
 fn norm(hash: &str) -> Option<String> {
@@ -52,6 +158,13 @@ fn content_headers(h: &str, len: u64) -> HeaderMap {
     hm.insert(header::ACCEPT_RANGES, "bytes".parse().unwrap());
     hm.insert(header::ACCESS_CONTROL_ALLOW_ORIGIN, "*".parse().unwrap());
     hm.insert(header::X_CONTENT_TYPE_OPTIONS, "nosniff".parse().unwrap());
+    // Defense-in-depth: declare it a non-renderable download + a restrictive CSP, so even if a
+    // browser is pointed straight at attacker bytes it can't render/execute them.
+    hm.insert(header::CONTENT_DISPOSITION, "attachment".parse().unwrap());
+    hm.insert(
+        header::CONTENT_SECURITY_POLICY,
+        "default-src 'none'; sandbox".parse().unwrap(),
+    );
     hm.insert(header::CONTENT_LENGTH, len.to_string().parse().unwrap());
     hm.insert("x-csd-payload-hash", format!("0x{h}").parse().unwrap());
     hm
@@ -60,6 +173,9 @@ fn content_headers(h: &str, len: u64) -> HeaderMap {
 async fn head_content(State(st): State<GwState>, Path(hash): Path<String>) -> Response {
     match norm(&hash) {
         None => StatusCode::BAD_REQUEST.into_response(),
+        Some(h) if st.store.is_denied(&h).await => {
+            (StatusCode::GONE, "content removed by the operator").into_response()
+        }
         Some(h) => match st.store.has(&h).await {
             Some(len) => (StatusCode::OK, content_headers(&h, len)).into_response(),
             None => StatusCode::NOT_FOUND.into_response(),
@@ -78,6 +194,17 @@ async fn get_content(
             "want /content/0x<64-hex payload_hash>",
         )
             .into_response();
+    };
+    // operator takedown: never serve denied content
+    if st.store.is_denied(&h).await {
+        return (StatusCode::GONE, "content removed by the operator").into_response();
+    }
+    // bound concurrent reads (each buffers up to one max-object) so a flood can't exhaust RAM/IO
+    let _permit = match st.conns.try_acquire() {
+        Ok(p) => p,
+        Err(_) => {
+            return (StatusCode::SERVICE_UNAVAILABLE, "gateway busy").into_response();
+        }
     };
     let Some(bytes) = st.store.get(&h).await else {
         return (StatusCode::NOT_FOUND, "not held by this gateway").into_response();
@@ -149,7 +276,13 @@ async fn pins(State(st): State<GwState>) -> impl IntoResponse {
 }
 
 async fn health(State(st): State<GwState>) -> impl IntoResponse {
-    Json(
-        json!({ "ok": true, "pinned": st.store.count().await, "bytes": st.store.total_bytes().await, "max_object_bytes": st.max_bytes }),
-    )
+    Json(json!({
+        "ok": true,
+        "pinned": st.store.count().await,
+        "bytes": st.store.total_bytes().await,
+        "max_object_bytes": st.max_bytes,
+        "max_store_bytes": st.store.max_bytes(),
+        "denied": st.store.denied_count().await,
+        "admin_api": st.admin_token.is_some(),
+    }))
 }

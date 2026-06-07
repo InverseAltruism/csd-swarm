@@ -44,8 +44,12 @@ CSD_SWARM_STORE=./swarm-store \
 | `CSD_ORIGIN` | `http://127.0.0.1:7777` | where to fetch content from (`GET {origin}/content/0x<hash>`) |
 | `CSD_SWARM_LISTEN` | `127.0.0.1:8791` | the HTTP gateway address |
 | `CSD_SWARM_STORE` | `./swarm-store` | where to keep the stored content |
-| `CSD_MAX_OBJECT` | `2097152` | biggest object to accept (2 MiB; abuse limit) |
+| `CSD_MAX_OBJECT` | `2097152` | biggest single object to accept (2 MiB) |
+| `CSD_MAX_STORE_BYTES` | `10737418240` | total disk budget (10 GiB; `0` = unlimited). New content past this is not pinned — prevents disk-fill |
 | `CSD_CONFIRMATIONS` | `3` | how many confirmations before storing a post's content |
+| `CSD_ADMIN_TOKEN` | _(off)_ | set a secret to enable the **takedown API**; unset = you cannot remove content over HTTP |
+| `CSD_FOLLOW_URI_HINTS` | `0` | follow attacker-supplied on-chain "hint" URLs (off by default — keeps your IP private) |
+| `CSD_GATEWAY_MAX_CONNS` | `64` | max concurrent content reads (RAM/IO abuse guard) |
 | `CSD_P2P_LISTEN` | `/ip4/0.0.0.0/tcp/0` | peer-to-peer listen address |
 | `CSD_P2P_BOOTSTRAP` | _(none)_ | a peer to connect to (so content replicates between you) |
 
@@ -54,20 +58,49 @@ a **stable identity** across restarts (a key saved in the store dir), so others 
 
 ### What it serves
 - `GET /content/0x<hash>` (and `HEAD`) — the bytes for that hash; the body always matches the hash,
-  cached as immutable, with HTTP range support.
+  cached as immutable, served as a non-renderable download, with HTTP range support.
 - `GET /pins` — what this node is holding.
-- `GET /health` — count and total size held.
+- `GET /health` — count, total size, store budget, denylist size.
 
-## Security notes (it serves over HTTP)
+## ⚠️ Running a node means hosting public content — read this
+
+Anyone can post anything to the chain for a small fee, and this node will fetch and **re-serve** it.
+That means you could end up hosting content you object to (or that's illegal where you live). The
+node gives you the controls to deal with that:
+
+**Take content down (and keep it down):**
+```bash
+# set CSD_ADMIN_TOKEN=<secret> first, then:
+curl -X DELETE  http://127.0.0.1:8791/content/0x<hash> -H "Authorization: Bearer <secret>"
+```
+This **purges the blob and adds the hash to a denylist** (`<store>/denylist.txt`), so the node will
+never fetch, store, or serve it again — even though the chain still references it. (A plain `rm`
+wouldn't work: the node would re-download it on the next pass. The denylist is what makes a takedown
+*stick*.) `POST /admin/allow/0x<hash>` reverses it; the denylist survives restarts. You can also
+pre-seed `denylist.txt` (one hash per line) before starting.
+
+**Other operator protections (on by default):**
+- **Disk can't be filled** — total storage is capped (`CSD_MAX_STORE_BYTES`); past the budget, new
+  content simply isn't pinned, so an attacker can't fill your disk and crash the host.
+- **Your IP stays private** — the node only fetches from your configured content server, not from
+  attacker-supplied "hint" URLs, unless you opt in (`CSD_FOLLOW_URI_HINTS=1`).
+- **Served safely** — content is sent as `application/json` + `nosniff` + `Content-Disposition:
+  attachment` + a locked-down CSP, so a browser pointed at attacker bytes can't render or run them.
+  The gateway also caps concurrent reads to bound memory/CPU.
+
+**Recommended deployment:** keep the store on its own disk/partition, run behind a reverse proxy
+with TLS + rate limiting if you expose the gateway publicly, and set an admin token so you can
+respond to abuse reports.
+
+## Security notes (integrity & network)
 
 - **Content is self-certifying.** Bytes are only stored/served if `sha256(bytes)` equals the
   on-chain hash, so a hostile content server or peer can never feed you fake bytes.
-- **No fetching internal addresses.** Content "hint" URLs from the chain and any discovered content
-  servers are only fetched if they point at a **public** host — requests to localhost, private
-  networks, or cloud-metadata addresses are refused (no server-side request forgery), and redirects
-  are re-checked the same way.
-- **Bounded.** Object size is capped; the peer-discovery table is bounded; the gateway sends
-  `nosniff` and never serves attacker bytes as HTML.
+- **No fetching internal addresses.** Any URL the node fetches must point at a **public** host —
+  localhost, private networks, and cloud-metadata addresses are refused (no server-side request
+  forgery), and redirects are re-checked the same way.
+- **Bounded everywhere.** Per-object size, total disk, concurrent reads, and the peer-discovery
+  table are all capped.
 
 ## Honest limit
 

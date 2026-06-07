@@ -70,6 +70,8 @@ async fn gateway_self_certifies_and_handles_errors() {
     let gw = spawn(router(GwState {
         store,
         max_bytes: 1 << 20,
+        admin_token: None,
+        conns: std::sync::Arc::new(tokio::sync::Semaphore::new(64)),
     }))
     .await;
     let client = reqwest::Client::new();
@@ -151,6 +153,8 @@ async fn gateway_refuses_to_serve_corrupted_store_bytes() {
     let gw = spawn(router(GwState {
         store,
         max_bytes: 1 << 20,
+        admin_token: None,
+        conns: std::sync::Arc::new(tokio::sync::Semaphore::new(64)),
     }))
     .await;
     let client = reqwest::Client::new();
@@ -161,4 +165,48 @@ async fn gateway_refuses_to_serve_corrupted_store_bytes() {
         .await
         .unwrap();
     assert_eq!(r.status(), 500);
+}
+
+#[tokio::test]
+async fn takedown_api_removes_content_and_blocks_redownload() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(dir.path()).await.unwrap();
+    let h = sha256_hex(GOOD);
+    store.put(&h, GOOD).await.unwrap();
+
+    let gw = spawn(router(GwState {
+        store: store.clone(),
+        max_bytes: 1 << 20,
+        admin_token: Some("s3cret".into()),
+        conns: std::sync::Arc::new(tokio::sync::Semaphore::new(64)),
+    }))
+    .await;
+    let client = reqwest::Client::new();
+
+    // served before takedown
+    assert_eq!(client.get(format!("{gw}/content/0x{h}")).send().await.unwrap().status(), 200);
+
+    // DELETE without the token is REFUSED (content stays up)
+    let no_auth = client.delete(format!("{gw}/content/0x{h}")).send().await.unwrap();
+    assert_eq!(no_auth.status(), 403);
+    assert_eq!(client.get(format!("{gw}/content/0x{h}")).send().await.unwrap().status(), 200);
+
+    // DELETE WITH the token → purged + denied
+    let del = client.delete(format!("{gw}/content/0x{h}")).bearer_auth("s3cret").send().await.unwrap();
+    assert_eq!(del.status(), 200);
+
+    // now GONE on the gateway…
+    assert_eq!(client.get(format!("{gw}/content/0x{h}")).send().await.unwrap().status(), 410);
+    assert_eq!(client.head(format!("{gw}/content/0x{h}")).send().await.unwrap().status(), 410);
+    // …and the store refuses to re-store it (so the ingest loop can't bring it back)
+    assert!(store.is_denied(&h).await);
+    assert!(store.put(&h, GOOD).await.is_err());
+    assert!(store.has(&h).await.is_none());
+
+    // allow it back (admin) → store can hold it again
+    let allow = client.post(format!("{gw}/admin/allow/0x{h}")).bearer_auth("s3cret").send().await.unwrap();
+    assert_eq!(allow.status(), 200);
+    assert!(!store.is_denied(&h).await);
+    store.put(&h, GOOD).await.unwrap();
+    assert_eq!(client.get(format!("{gw}/content/0x{h}")).send().await.unwrap().status(), 200);
 }

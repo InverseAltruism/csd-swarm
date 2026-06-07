@@ -12,8 +12,18 @@
 //   CSD_SWARM_LISTEN gateway bind           (default 127.0.0.1:8791)
 //   CSD_SWARM_STORE  blob store dir         (default ./swarm-store)
 //   CSD_MAX_OBJECT   max object bytes       (default 2097152 = 2 MiB)
+//   CSD_MAX_STORE_BYTES total store budget  (default 10 GiB; 0 = unlimited) — disk-fill guard
 //   CSD_CONFIRMATIONS confirm depth         (default 3)
 //   CSD_POLL_SECS    ingest poll interval   (default 30)
+//   CSD_ADMIN_TOKEN  enable takedown HTTP API (default off) — DELETE /content/:hash, /admin/*
+//   CSD_FOLLOW_URI_HINTS  follow attacker-supplied on-chain uri hints (default 0 = off; IP-privacy)
+//   CSD_GATEWAY_MAX_CONNS  max concurrent content reads (default 64) — RAM/IO DoS guard
+//
+// OPERATOR SAFETY: the bytes are attacker-chosen. This node will only fetch/store/serve content
+// that is NOT on the operator denylist, refuses to exceed the store budget, and (by default) does
+// NOT chase attacker-supplied uri hints. To take content down: `DELETE /content/0x<hash>` with the
+// admin token — it purges the blob AND blocks re-download (the chain still references it, so a
+// plain `rm` would be re-fetched within one poll).
 use csd_swarm::acquire::{acquire, candidate_urls};
 use csd_swarm::chain::Chain;
 use csd_swarm::gateway::{router, GwState};
@@ -43,6 +53,21 @@ async fn main() -> anyhow::Result<()> {
         .unwrap_or(2 * 1024 * 1024);
     let confirmations: u64 = env("CSD_CONFIRMATIONS", "3").parse().unwrap_or(3);
     let poll = Duration::from_secs(env("CSD_POLL_SECS", "30").parse().unwrap_or(30));
+    // total-store disk-fill guard (default 10 GiB; 0 = unlimited)
+    let store_cap: u64 = env("CSD_MAX_STORE_BYTES", "10737418240")
+        .parse()
+        .unwrap_or(10 * 1024 * 1024 * 1024);
+    // takedown HTTP API is OFF unless the operator sets a token
+    let admin_token = match env("CSD_ADMIN_TOKEN", "") {
+        s if s.is_empty() => None,
+        s => Some(s),
+    };
+    // attacker-supplied on-chain `uri` hints are NOT followed by default (the origin is always used)
+    let follow_uri_hints = matches!(
+        env("CSD_FOLLOW_URI_HINTS", "0").as_str(),
+        "1" | "true" | "yes"
+    );
+    let gw_max_conns: usize = env("CSD_GATEWAY_MAX_CONNS", "64").parse().unwrap_or(64);
     let p2p_listen = env("CSD_P2P_LISTEN", "/ip4/0.0.0.0/tcp/0");
     // persisted libp2p identity (stable PeerId across restarts). Default lives in the store dir;
     // set CSD_P2P_IDENTITY=- to opt out (ephemeral identity each start).
@@ -73,10 +98,16 @@ async fn main() -> anyhow::Result<()> {
         .timeout(Duration::from_secs(20))
         .redirect(redirect_policy)
         .build()?;
-    let store = Store::open(&store_dir).await?;
+    let store = Store::open(&store_dir).await?.with_max_bytes(store_cap);
     let chain = Chain::new(rpc.clone(), client.clone());
 
-    tracing::info!(%rpc, %origin, %listen, store=%store_dir, max_bytes, confirmations, "csd-swarm starting ({} already pinned)", store.count().await);
+    tracing::info!(%rpc, %origin, %listen, store=%store_dir, max_bytes, store_cap, follow_uri_hints, admin_api=admin_token.is_some(), confirmations, "csd-swarm starting ({} pinned, {} denied)", store.count().await, store.denied_count().await);
+    if store_cap == 0 {
+        tracing::warn!("CSD_MAX_STORE_BYTES=0 (unlimited) — an attacker paying propose fees can fill this disk; set a budget");
+    }
+    if admin_token.is_none() {
+        tracing::warn!("CSD_ADMIN_TOKEN unset — the takedown API (DELETE /content/:hash) is DISABLED; you cannot remove abusive content over HTTP");
+    }
 
     // ── p2p task: serve Have/Get + announce held hashes + satisfy Want from peers ──
     let (cmd_tx, cmd_rx) = mpsc::channel::<Cmd>(64);
@@ -115,13 +146,18 @@ async fn main() -> anyhow::Result<()> {
                         let (mut fetched, mut from_peer, mut failed, mut held) =
                             (0u64, 0u64, 0u64, 0u64);
                         for p in &pins {
+                            // operator denylist: never fetch/store content the operator refused
+                            if store.is_denied(&p.payload_hash).await {
+                                continue;
+                            }
                             if store.has(&p.payload_hash).await.is_some() {
                                 held += 1;
                                 continue;
                             }
                             // 1) try the content origin + any chain-discovered gateways
                             //    (all verified in acquire — gateways are untrusted transports)
-                            let mut urls = candidate_urls(&origin, &p.payload_hash, &p.uri);
+                            let mut urls =
+                                candidate_urls(&origin, &p.payload_hash, &p.uri, follow_uri_hints);
                             urls.extend(csd_swarm::gateways::expand(
                                 &gw_templates,
                                 &p.payload_hash,
@@ -182,7 +218,12 @@ async fn main() -> anyhow::Result<()> {
     }
 
     // ── gateway ──
-    let app = router(GwState { store, max_bytes });
+    let app = router(GwState {
+        store,
+        max_bytes,
+        admin_token,
+        conns: std::sync::Arc::new(tokio::sync::Semaphore::new(gw_max_conns)),
+    });
     let listener = tokio::net::TcpListener::bind(&listen).await?;
     tracing::info!("gateway on http://{listen}  (GET /content/0x<hash> · /pins · /health)");
     axum::serve(listener, app)
