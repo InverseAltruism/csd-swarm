@@ -28,10 +28,13 @@ pub async fn discover(client: &reqwest::Client, indexer_base: &str) -> Vec<Strin
 /// Expand discovered gateway templates for a specific payload hash. `{hash}` is the
 /// BARE hex — templates carry their own `0x` (e.g. `…/content/0x{hash}`).
 pub fn expand(templates: &[String], hash: &str) -> Vec<String> {
+    // chain-discovered gateway URLs are untrusted → expand then drop any whose host is not public
+    // (SSRF guard); bytes are still hash-verified in acquire on top of this.
     let bare = hash.trim_start_matches("0x");
     templates
         .iter()
         .map(|t| t.replace("{hash}", bare))
+        .filter(|u| crate::acquire::host_is_public(u))
         .collect()
 }
 

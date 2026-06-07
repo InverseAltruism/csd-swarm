@@ -57,8 +57,21 @@ async fn main() -> anyhow::Result<()> {
         .filter(|s| !s.is_empty())
         .collect();
 
+    // Custom redirect policy: cap at 3 hops AND refuse to follow a redirect to a non-public host
+    // (a public `uri` hint could otherwise 3xx inward to 169.254.169.254 / localhost — SSRF).
+    let redirect_policy = reqwest::redirect::Policy::custom(|attempt| {
+        if attempt.previous().len() >= 3 {
+            return attempt.error("too many redirects");
+        }
+        if csd_swarm::acquire::host_is_public(attempt.url().as_str()) {
+            attempt.follow()
+        } else {
+            attempt.stop()
+        }
+    });
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(20))
+        .redirect(redirect_policy)
         .build()?;
     let store = Store::open(&store_dir).await?;
     let chain = Chain::new(rpc.clone(), client.clone());

@@ -17,6 +17,13 @@ fn norm(hash: &str) -> String {
     hash.strip_prefix("0x").unwrap_or(hash).to_lowercase()
 }
 
+/// True only for a canonical 64-char lowercase-hex content hash. The store key is interpolated
+/// into a filename, so this is the guard that makes path traversal (`../…`) structurally
+/// impossible even if a caller ever passed an unvalidated hash.
+fn is_valid_hash(h: &str) -> bool {
+    h.len() == 64 && h.bytes().all(|b| b.is_ascii_hexdigit())
+}
+
 impl Store {
     pub async fn open(dir: impl AsRef<Path>) -> Result<Self> {
         let dir = dir.as_ref().to_path_buf();
@@ -50,6 +57,9 @@ impl Store {
 
     pub async fn get(&self, hash: &str) -> Option<Vec<u8>> {
         let h = norm(hash);
+        if !is_valid_hash(&h) {
+            return None;
+        }
         if !self.index.read().await.contains_key(&h) {
             return None;
         }
@@ -59,6 +69,9 @@ impl Store {
     /// Persist bytes under `hash`. Caller MUST have verified sha256(bytes)==hash first.
     pub async fn put(&self, hash: &str, bytes: &[u8]) -> Result<()> {
         let h = norm(hash);
+        if !is_valid_hash(&h) {
+            anyhow::bail!("refusing to store under a non-hex key");
+        }
         let tmp = self.dir.join(format!("{}.tmp", h));
         tokio::fs::write(&tmp, bytes).await.context("write tmp")?;
         tokio::fs::rename(&tmp, self.path(&h))

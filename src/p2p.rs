@@ -20,6 +20,9 @@ use tokio::sync::{mpsc, oneshot};
 
 const PROTO: &str = "/csd-content/1";
 const ANNOUNCE_TOPIC: &str = "csd-content/announce/v1";
+// Bounds on the gossip-fed providers map (anti-DoS; a peer can't grow it without limit).
+const MAX_TRACKED_HASHES: usize = 100_000;
+const MAX_PEERS_PER_HASH: usize = 64;
 
 /// Load a persisted ed25519 keypair (so our PeerId is STABLE across restarts), or generate one
 /// and save it. Without this the node draws a fresh random identity each start — which breaks
@@ -45,12 +48,22 @@ fn load_or_create_identity(path: Option<std::path::PathBuf>) -> Result<libp2p::i
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir)?;
     }
-    std::fs::write(&path, &enc)?;
+    // Create with 0600 ATOMICALLY (O_CREAT|O_EXCL + mode) so the private identity is never briefly
+    // world-readable between write and chmod. Exclusive create also avoids clobbering a key that
+    // appeared concurrently.
     #[cfg(unix)]
     {
-        use std::os::unix::fs::PermissionsExt;
-        let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
+        use std::io::Write;
+        use std::os::unix::fs::OpenOptionsExt;
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&path)?;
+        f.write_all(&enc)?;
     }
+    #[cfg(not(unix))]
+    std::fs::write(&path, &enc)?;
     tracing::info!(?path, "generated + persisted new p2p identity");
     Ok(kp)
 }
@@ -206,7 +219,15 @@ pub async fn run(
                     if let Some(src) = message.source {
                         for line in String::from_utf8_lossy(&message.data).lines() {
                             let h = norm(line);
-                            if h.len() == 64 { providers.entry(h).or_default().insert(src); }
+                            // Bound the providers map: a malicious peer can otherwise gossip
+                            // unlimited fake hashes and grow it without limit (OOM DoS). Require
+                            // valid 64-hex, cap total tracked hashes, and cap peers-per-hash.
+                            let valid = h.len() == 64 && h.bytes().all(|b| b.is_ascii_hexdigit());
+                            if !valid { continue; }
+                            if providers.contains_key(&h) || providers.len() < MAX_TRACKED_HASHES {
+                                let set = providers.entry(h).or_default();
+                                if set.len() < MAX_PEERS_PER_HASH { set.insert(src); }
+                            }
                         }
                     }
                 }
@@ -214,7 +235,16 @@ pub async fn run(
                     request_response::Message::Request { request, channel, .. } => {
                         let resp = match request {
                             Req::Have(h) => { let n = norm(&h); Resp::Have { has: store.has(&n).await.is_some(), len: store.has(&n).await.unwrap_or(0) } }
-                            Req::Get(h) => Resp::Get(store.get(&norm(&h)).await), // only bytes we hold (verified at store time)
+                            // serve only bytes we hold AND re-verify sha256==hash before handing
+                            // them to a peer, so a locally-tampered blob can't be propagated.
+                            Req::Get(h) => {
+                                let n = norm(&h);
+                                let ok = match store.get(&n).await {
+                                    Some(b) if crate::acquire::sha256_hex(&b) == n => Some(b),
+                                    _ => None,
+                                };
+                                Resp::Get(ok)
+                            }
                         };
                         let _ = swarm.behaviour_mut().rr.send_response(channel, resp);
                     }

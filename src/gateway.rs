@@ -51,6 +51,7 @@ fn content_headers(h: &str, len: u64) -> HeaderMap {
     );
     hm.insert(header::ACCEPT_RANGES, "bytes".parse().unwrap());
     hm.insert(header::ACCESS_CONTROL_ALLOW_ORIGIN, "*".parse().unwrap());
+    hm.insert(header::X_CONTENT_TYPE_OPTIONS, "nosniff".parse().unwrap());
     hm.insert(header::CONTENT_LENGTH, len.to_string().parse().unwrap());
     hm.insert("x-csd-payload-hash", format!("0x{h}").parse().unwrap());
     hm
@@ -97,8 +98,15 @@ async fn get_content(
         .and_then(parse_range)
     {
         let (start, end) = clamp_range(rng, total);
-        if start > end {
-            return StatusCode::RANGE_NOT_SATISFIABLE.into_response();
+        // `start >= total` also catches the empty-object case (total==0 → start 0 >= 0): without
+        // it, `bytes[0..=0]` panics on an empty Vec (DoS, and a crash under panic=abort).
+        if start > end || start >= total {
+            let mut hm = HeaderMap::new();
+            hm.insert(
+                header::CONTENT_RANGE,
+                format!("bytes */{total}").parse().unwrap(),
+            );
+            return (StatusCode::RANGE_NOT_SATISFIABLE, hm).into_response();
         }
         let slice = bytes[start as usize..=end as usize].to_vec();
         let mut hm = content_headers(&h, slice.len() as u64);
