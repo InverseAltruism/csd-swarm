@@ -52,7 +52,7 @@ async fn node_b_fetches_from_node_a_without_an_origin() {
                 1 << 20,
                 cmd_b_rx,
                 None,
-            None,
+                None,
             )
             .await;
         });
