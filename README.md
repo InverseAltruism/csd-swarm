@@ -43,6 +43,13 @@ CSD_SWARM_STORE=./swarm-store \
 | `CSD_CONFIRMATIONS` | `3` | confirm depth before pinning |
 | `CSD_P2P_LISTEN` | `/ip4/0.0.0.0/tcp/0` | libp2p listen multiaddr (peer replication) |
 | `CSD_P2P_BOOTSTRAP` | _(none)_ | comma-separated peer multiaddrs to dial |
+| `CSD_INDEXER` | _(none)_ | optional L2 indexer base for **L3 gateway discovery** (`/registry/gateways`) — no hardcoded gateway URLs |
+
+### Gateway discovery (L3)
+Set `CSD_INDEXER` and each ingest pass pulls the chain-ranked gateway list from the L2 indexer's
+`csd:gateways` resolver, adding those URLs as extra content sources alongside the origin and peers.
+Bytes from any gateway are still **verified `sha256==hash`** before storing — a discovered gateway is
+an untrusted transport, so this only improves availability and removes the single-origin dependency.
 
 ### Peer replication (libp2p)
 Nodes announce held hashes over **gossipsub** (who-has) and serve a 2-verb **request-response**

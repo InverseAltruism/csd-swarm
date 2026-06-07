@@ -3,5 +3,6 @@
 pub mod acquire;
 pub mod chain;
 pub mod gateway;
+pub mod gateways;
 pub mod p2p;
 pub mod store;

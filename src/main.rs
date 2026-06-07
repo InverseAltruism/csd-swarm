@@ -34,6 +34,8 @@ async fn main() -> anyhow::Result<()> {
 
     let rpc = env("CSD_RPC", "http://127.0.0.1:8790");
     let origin = env("CSD_ORIGIN", "http://127.0.0.1:7777");
+    // optional L2 indexer for L3 gateway discovery (no hardcoded gateway URLs)
+    let indexer = env("CSD_INDEXER", "");
     let listen = env("CSD_SWARM_LISTEN", "127.0.0.1:8791");
     let store_dir = env("CSD_SWARM_STORE", "./swarm-store");
     let max_bytes: usize = env("CSD_MAX_OBJECT", "2097152")
@@ -76,9 +78,16 @@ async fn main() -> anyhow::Result<()> {
         let store = store.clone();
         let client = client.clone();
         let origin = origin.clone();
+        let indexer = indexer.clone();
         let cmd_tx = cmd_tx.clone();
         tokio::spawn(async move {
             loop {
+                // L3: refresh chain-discovered gateways each pass (no hardcoded URLs)
+                let gw_templates = if indexer.is_empty() {
+                    Vec::new()
+                } else {
+                    csd_swarm::gateways::discover(&client, &indexer).await
+                };
                 match chain.confirmed_pins(confirmations, 200).await {
                     Ok(pins) => {
                         let (mut fetched, mut from_peer, mut failed, mut held) =
@@ -88,8 +97,13 @@ async fn main() -> anyhow::Result<()> {
                                 held += 1;
                                 continue;
                             }
-                            // 1) try the content origin (verified in acquire)
-                            let urls = candidate_urls(&origin, &p.payload_hash, &p.uri);
+                            // 1) try the content origin + any chain-discovered gateways
+                            //    (all verified in acquire — gateways are untrusted transports)
+                            let mut urls = candidate_urls(&origin, &p.payload_hash, &p.uri);
+                            urls.extend(csd_swarm::gateways::expand(
+                                &gw_templates,
+                                &p.payload_hash,
+                            ));
                             let mut bytes = acquire(&client, &p.payload_hash, &urls, max_bytes)
                                 .await
                                 .ok();
