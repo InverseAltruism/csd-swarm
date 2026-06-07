@@ -44,6 +44,13 @@ async fn main() -> anyhow::Result<()> {
     let confirmations: u64 = env("CSD_CONFIRMATIONS", "3").parse().unwrap_or(3);
     let poll = Duration::from_secs(env("CSD_POLL_SECS", "30").parse().unwrap_or(30));
     let p2p_listen = env("CSD_P2P_LISTEN", "/ip4/0.0.0.0/tcp/0");
+    // persisted libp2p identity (stable PeerId across restarts). Default lives in the store dir;
+    // set CSD_P2P_IDENTITY=- to opt out (ephemeral identity each start).
+    let identity_path = match env("CSD_P2P_IDENTITY", "") {
+        s if s == "-" => None,
+        s if s.is_empty() => Some(std::path::PathBuf::from(&store_dir).join("p2p-identity.key")),
+        s => Some(std::path::PathBuf::from(s)),
+    };
     let bootstrap: Vec<String> = env("CSD_P2P_BOOTSTRAP", "")
         .split(',')
         .map(|s| s.trim().to_string())
@@ -66,8 +73,10 @@ async fn main() -> anyhow::Result<()> {
             .parse()
             .expect("CSD_P2P_LISTEN must be a multiaddr");
         let boot: Vec<_> = bootstrap.iter().filter_map(|s| s.parse().ok()).collect();
+        let id_path = identity_path.clone();
         tokio::spawn(async move {
-            if let Err(e) = p2p::run(store, listen_ma, boot, max_bytes, cmd_rx, None).await {
+            if let Err(e) = p2p::run(store, listen_ma, boot, max_bytes, cmd_rx, None, id_path).await
+            {
                 tracing::error!("p2p task exited: {e}");
             }
         });

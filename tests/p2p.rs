@@ -28,6 +28,7 @@ async fn node_b_fetches_from_node_a_without_an_origin() {
             1 << 20,
             cmd_a_rx,
             Some(laddr_tx),
+            None,
         )
         .await;
     });
@@ -51,6 +52,7 @@ async fn node_b_fetches_from_node_a_without_an_origin() {
                 1 << 20,
                 cmd_b_rx,
                 None,
+            None,
             )
             .await;
         });
@@ -95,6 +97,7 @@ async fn want_for_an_unknown_hash_returns_none() {
             vec![],
             1 << 20,
             cmd_rx,
+            None,
             None,
         )
         .await;

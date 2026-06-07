@@ -21,6 +21,40 @@ use tokio::sync::{mpsc, oneshot};
 const PROTO: &str = "/csd-content/1";
 const ANNOUNCE_TOPIC: &str = "csd-content/announce/v1";
 
+/// Load a persisted ed25519 keypair (so our PeerId is STABLE across restarts), or generate one
+/// and save it. Without this the node draws a fresh random identity each start — which breaks
+/// bootstrap multiaddrs (`/p2p/<id>`) and stales any `csd:peers` registry announcement that
+/// names this peer. The key is the node's network identity, not a wallet key, but still secret:
+/// written 0600. `None` path → ephemeral identity (tests / throwaway nodes).
+fn load_or_create_identity(path: Option<std::path::PathBuf>) -> Result<libp2p::identity::Keypair> {
+    use libp2p::identity::Keypair;
+    let Some(path) = path else {
+        return Ok(Keypair::generate_ed25519());
+    };
+    if let Ok(bytes) = std::fs::read(&path) {
+        match Keypair::from_protobuf_encoding(&bytes) {
+            Ok(kp) => {
+                tracing::info!(?path, "loaded persisted p2p identity");
+                return Ok(kp);
+            }
+            Err(e) => tracing::warn!(?path, %e, "p2p identity file unreadable — regenerating"),
+        }
+    }
+    let kp = Keypair::generate_ed25519();
+    let enc = kp.to_protobuf_encoding()?;
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir)?;
+    }
+    std::fs::write(&path, &enc)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
+    }
+    tracing::info!(?path, "generated + persisted new p2p identity");
+    Ok(kp)
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum Req {
     Have(String),
@@ -95,8 +129,10 @@ pub async fn run(
     max_bytes: usize,
     mut cmd_rx: mpsc::Receiver<Cmd>,
     mut listen_report: Option<oneshot::Sender<Multiaddr>>,
+    identity_path: Option<std::path::PathBuf>,
 ) -> Result<()> {
-    let mut swarm = libp2p::SwarmBuilder::with_new_identity()
+    let keypair = load_or_create_identity(identity_path)?;
+    let mut swarm = libp2p::SwarmBuilder::with_existing_identity(keypair)
         .with_tokio()
         .with_tcp(
             libp2p::tcp::Config::default(),
