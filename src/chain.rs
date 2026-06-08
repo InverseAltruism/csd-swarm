@@ -76,19 +76,40 @@ impl Chain {
         confirmations: u64,
         per_domain: u32,
     ) -> Result<Vec<PinItem>> {
+        use futures_util::stream::{self, StreamExt};
         let tip = self.tip_height().await?;
         let max_h = tip.saturating_sub(confirmations);
         let domains = self.get::<DomainsResp>("/domains").await?.domains;
-        let mut by_hash: HashMap<String, PinItem> = HashMap::new();
-        for d in domains {
+        // Fetch each domain's proposals with bounded concurrency so one slow/hanging domain doesn't
+        // head-of-line block the whole pass (E1). A per-domain failure yields an empty list (logged),
+        // not a fatal error — a partial RPC blip just shrinks this pass and recovers next poll.
+        let fetched: Vec<Vec<ProposalItem>> = stream::iter(domains.into_iter().map(|d| async move {
             let path = format!("/proposals/{}/{}", urlencode(&d.domain), per_domain);
-            let ps = match self.get::<ProposalsResp>(&path).await {
-                Ok(p) => p.proposals,
+            match self.get::<ProposalsResp>(&path).await {
+                Ok(p) => {
+                    // Loud, NOT silent, truncation: a full page means the domain may hold more than we
+                    // can see (the node caps /proposals at 500 with no offset).
+                    if p.proposals.len() as u32 >= per_domain {
+                        tracing::warn!(
+                            "domain {} returned {} proposals (>= per_domain cap {}): some may be unlisted — node /proposals is capped with no offset; full coverage needs a node pagination param or block-scan ingest",
+                            d.domain,
+                            p.proposals.len(),
+                            per_domain
+                        );
+                    }
+                    p.proposals
+                }
                 Err(e) => {
                     tracing::warn!("list {} failed: {e}", d.domain);
-                    continue;
+                    Vec::new()
                 }
-            };
+            }
+        }))
+        .buffer_unordered(8)
+        .collect()
+        .await;
+        let mut by_hash: HashMap<String, PinItem> = HashMap::new();
+        for ps in fetched {
             for p in ps {
                 if p.height > max_h {
                     continue;

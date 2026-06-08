@@ -180,16 +180,24 @@ impl Store {
         Ok(self.purge(&h).await)
     }
 
-    /// Remove a hash from the denylist (re-allow). Rewrites the denylist file.
+    /// Remove a hash from the denylist (re-allow). Rewrites the denylist file ATOMICALLY (write a
+    /// .tmp then rename), so a crash mid-rewrite can never truncate the denylist and silently
+    /// re-allow other banned hashes (C-W4) — the same tmp+rename discipline as `put`.
     pub async fn allow(&self, hash: &str) -> Result<bool> {
         let h = norm(hash);
         let removed = self.denied.write().await.remove(&h);
         if removed {
-            let set = self.denied.read().await;
-            let body: String = set.iter().map(|x| format!("{x}\n")).collect();
-            tokio::fs::write(&self.denylist_path, body)
+            let body: String = {
+                let set = self.denied.read().await;
+                set.iter().map(|x| format!("{x}\n")).collect()
+            };
+            let tmp = self.denylist_path.with_file_name("denylist.txt.tmp");
+            tokio::fs::write(&tmp, body)
                 .await
-                .context("rewrite denylist")?;
+                .context("write denylist tmp")?;
+            tokio::fs::rename(&tmp, &self.denylist_path)
+                .await
+                .context("rename denylist into place")?; // atomic
         }
         Ok(removed)
     }
@@ -278,6 +286,32 @@ mod tests {
         let s2 = Store::open(dir.path()).await.unwrap();
         assert!(s2.is_denied(&h).await);
         assert!(s2.put(&h, &bytes).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn allow_rewrite_preserves_other_denied_and_survives_reopen() {
+        // C-W4: re-allowing one hash must atomically rewrite the denylist WITHOUT dropping the others.
+        let dir = tempfile::tempdir().unwrap();
+        let s = Store::open(dir.path()).await.unwrap();
+        let h1 = crate::acquire::sha256_hex(b"one");
+        let h2 = crate::acquire::sha256_hex(b"two");
+        let h3 = crate::acquire::sha256_hex(b"three");
+        // deny() returns whether a blob was purged (none here — no put), so assert the denylist state
+        s.deny(&h1).await.unwrap();
+        s.deny(&h2).await.unwrap();
+        s.deny(&h3).await.unwrap();
+        assert!(s.is_denied(&h1).await && s.is_denied(&h2).await && s.is_denied(&h3).await);
+        assert!(s.allow(&h2).await.unwrap(), "h2 re-allowed");
+        assert!(!s.is_denied(&h2).await);
+        assert!(
+            s.is_denied(&h1).await && s.is_denied(&h3).await,
+            "others stay denied"
+        );
+        // the rewritten denylist is correct + durable across a restart
+        let s2 = Store::open(dir.path()).await.unwrap();
+        assert!(s2.is_denied(&h1).await, "h1 still denied after reopen");
+        assert!(!s2.is_denied(&h2).await, "h2 allowed after reopen");
+        assert!(s2.is_denied(&h3).await, "h3 still denied after reopen");
     }
 
     #[tokio::test]

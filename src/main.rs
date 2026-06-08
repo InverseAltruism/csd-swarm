@@ -52,6 +52,11 @@ async fn main() -> anyhow::Result<()> {
         .parse()
         .unwrap_or(2 * 1024 * 1024);
     let confirmations: u64 = env("CSD_CONFIRMATIONS", "3").parse().unwrap_or(3);
+    // Proposals requested per domain. The node's /proposals/:domain/:n is hard-capped at 500 with no
+    // offset, so 500 captures everything that endpoint can serve; confirmed_pins logs loudly if a
+    // domain hits the cap (some proposals would then be unreachable — needs a node pagination param or
+    // a block-scan ingest, tracked as a follow-up). (E1)
+    let per_domain: u32 = env("CSD_PER_DOMAIN", "500").parse().unwrap_or(500);
     let poll = Duration::from_secs(env("CSD_POLL_SECS", "30").parse().unwrap_or(30));
     // total-store disk-fill guard (default 10 GiB; 0 = unlimited)
     let store_cap: u64 = env("CSD_MAX_STORE_BYTES", "10737418240")
@@ -141,7 +146,7 @@ async fn main() -> anyhow::Result<()> {
                 } else {
                     csd_swarm::gateways::discover(&client, &indexer).await
                 };
-                match chain.confirmed_pins(confirmations, 200).await {
+                match chain.confirmed_pins(confirmations, per_domain).await {
                     Ok(pins) => {
                         let (mut fetched, mut from_peer, mut failed, mut held) =
                             (0u64, 0u64, 0u64, 0u64);
