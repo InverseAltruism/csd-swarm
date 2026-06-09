@@ -29,6 +29,7 @@ async fn node_b_fetches_from_node_a_without_an_origin() {
             cmd_a_rx,
             Some(laddr_tx),
             None,
+            csd_swarm::p2p::new_peer_status(),
         )
         .await;
     });
@@ -53,6 +54,7 @@ async fn node_b_fetches_from_node_a_without_an_origin() {
                 cmd_b_rx,
                 None,
                 None,
+                csd_swarm::p2p::new_peer_status(),
             )
             .await;
         });
@@ -108,6 +110,7 @@ async fn a_malicious_peer_serving_wrong_bytes_cannot_poison() {
             cmd_a_rx,
             Some(laddr_tx),
             None,
+            csd_swarm::p2p::new_peer_status(),
         )
         .await;
     });
@@ -130,6 +133,7 @@ async fn a_malicious_peer_serving_wrong_bytes_cannot_poison() {
                 cmd_b_rx,
                 None,
                 None,
+                csd_swarm::p2p::new_peer_status(),
             )
             .await;
         });
@@ -181,6 +185,7 @@ async fn want_for_an_unknown_hash_returns_none() {
             cmd_rx,
             None,
             None,
+            csd_swarm::p2p::new_peer_status(),
         )
         .await;
     });

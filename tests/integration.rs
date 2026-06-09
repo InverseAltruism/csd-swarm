@@ -72,6 +72,7 @@ async fn gateway_self_certifies_and_handles_errors() {
         max_bytes: 1 << 20,
         admin_token: None,
         conns: std::sync::Arc::new(tokio::sync::Semaphore::new(64)),
+        peers: csd_swarm::p2p::new_peer_status(),
     }))
     .await;
     let client = reqwest::Client::new();
@@ -155,6 +156,7 @@ async fn gateway_refuses_to_serve_corrupted_store_bytes() {
         max_bytes: 1 << 20,
         admin_token: None,
         conns: std::sync::Arc::new(tokio::sync::Semaphore::new(64)),
+        peers: csd_swarm::p2p::new_peer_status(),
     }))
     .await;
     let client = reqwest::Client::new();
@@ -179,6 +181,7 @@ async fn takedown_api_removes_content_and_blocks_redownload() {
         max_bytes: 1 << 20,
         admin_token: Some("s3cret".into()),
         conns: std::sync::Arc::new(tokio::sync::Semaphore::new(64)),
+        peers: csd_swarm::p2p::new_peer_status(),
     }))
     .await;
     let client = reqwest::Client::new();
@@ -297,6 +300,7 @@ async fn adversarial_content_is_inert_opaque_bytes() {
         max_bytes: 1 << 20,
         admin_token: None,
         conns: std::sync::Arc::new(tokio::sync::Semaphore::new(64)),
+        peers: csd_swarm::p2p::new_peer_status(),
     }))
     .await;
     let client = reqwest::Client::new();

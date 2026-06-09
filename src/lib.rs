@@ -5,4 +5,5 @@ pub mod chain;
 pub mod gateway;
 pub mod gateways;
 pub mod p2p;
+pub mod peers;
 pub mod store;

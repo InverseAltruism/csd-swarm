@@ -114,17 +114,29 @@ async fn main() -> anyhow::Result<()> {
         tracing::warn!("CSD_ADMIN_TOKEN unset — the takedown API (DELETE /content/:hash) is DISABLED; you cannot remove abusive content over HTTP");
     }
 
+    // our own libp2p PeerId (to self-exclude from chain-discovered peer dials + fill our record)
+    let self_peer_id = identity_path
+        .as_ref()
+        .and_then(|p| csd_swarm::p2p::peer_id_at(p))
+        .unwrap_or_default();
+
     // ── p2p task: serve Have/Get + announce held hashes + satisfy Want from peers ──
     let (cmd_tx, cmd_rx) = mpsc::channel::<Cmd>(64);
+    let peer_status = csd_swarm::p2p::new_peer_status();
     {
         let store = store.clone();
         let listen_ma = p2p_listen
             .parse()
             .expect("CSD_P2P_LISTEN must be a multiaddr");
-        let boot: Vec<_> = bootstrap.iter().filter_map(|s| s.parse().ok()).collect();
+        // entry peers = explicit env bootstrap + chain-sourced (csd:peers via the indexer), so a
+        // node can join by reading the chain instead of hardcoding any IP.
+        let mut boot: Vec<libp2p::Multiaddr> = bootstrap.iter().filter_map(|s| s.parse().ok()).collect();
+        boot.extend(csd_swarm::peers::discover(&client, &indexer, &self_peer_id).await);
+        tracing::info!(entry_peers = boot.len(), "p2p bootstrap set (env + chain csd:peers)");
         let id_path = identity_path.clone();
+        let peer_status = peer_status.clone();
         tokio::spawn(async move {
-            if let Err(e) = p2p::run(store, listen_ma, boot, max_bytes, cmd_rx, None, id_path).await
+            if let Err(e) = p2p::run(store, listen_ma, boot, max_bytes, cmd_rx, None, id_path, peer_status).await
             {
                 tracing::error!("p2p task exited: {e}");
             }
@@ -138,6 +150,7 @@ async fn main() -> anyhow::Result<()> {
         let origin = origin.clone();
         let indexer = indexer.clone();
         let cmd_tx = cmd_tx.clone();
+        let self_peer_id = self_peer_id.clone();
         tokio::spawn(async move {
             loop {
                 // L3: refresh chain-discovered gateways each pass (no hardcoded URLs)
@@ -146,6 +159,12 @@ async fn main() -> anyhow::Result<()> {
                 } else {
                     csd_swarm::gateways::discover(&client, &indexer).await
                 };
+                // Re-discover entry peers from the on-chain csd:peers registry each pass and (re)dial
+                // them — so the mesh tracks the chain's peer set over time (no hardcoded IPs). Dialing
+                // an already-connected peer is a cheap no-op.
+                for addr in csd_swarm::peers::discover(&client, &indexer, &self_peer_id).await {
+                    let _ = cmd_tx.send(Cmd::Dial(addr)).await;
+                }
                 match chain.confirmed_pins(confirmations, per_domain).await {
                     Ok(pins) => {
                         let (mut fetched, mut from_peer, mut failed, mut held) =
@@ -228,6 +247,7 @@ async fn main() -> anyhow::Result<()> {
         max_bytes,
         admin_token,
         conns: std::sync::Arc::new(tokio::sync::Semaphore::new(gw_max_conns)),
+        peers: peer_status,
     });
     let listener = tokio::net::TcpListener::bind(&listen).await?;
     tracing::info!("gateway on http://{listen}  (GET /content/0x<hash> · /pins · /health)");
