@@ -27,6 +27,8 @@ pub struct GwState {
     /// Bounds concurrent content reads so a flood of GET/Range can't blow up RAM/IO (each read
     /// buffers up to one max-object, so peak ≈ permits × max_object).
     pub conns: Arc<Semaphore>,
+    /// Live connected-peer view (shared with the p2p task) for monitoring via /health + /p2p.
+    pub peers: crate::p2p::PeerStatus,
 }
 
 pub fn router(state: GwState) -> Router {
@@ -38,6 +40,7 @@ pub fn router(state: GwState) -> Router {
         .route("/admin/allow/:hash", post(allow_content))
         .route("/pins", get(pins))
         .route("/health", get(health))
+        .route("/p2p", get(p2p_peers))
         .with_state(state)
 }
 
@@ -284,5 +287,14 @@ async fn health(State(st): State<GwState>) -> impl IntoResponse {
         "max_store_bytes": st.store.max_bytes(),
         "denied": st.store.denied_count().await,
         "admin_api": st.admin_token.is_some(),
+        "p2p_peers": st.peers.read().await.len(),
     }))
+}
+
+/// Monitoring: the currently-connected libp2p peers (peer_id → remote multiaddr). Lets an
+/// operator SEE who's connected to the mesh in real time.
+async fn p2p_peers(State(st): State<GwState>) -> impl IntoResponse {
+    let map = st.peers.read().await;
+    let peers: Vec<_> = map.iter().map(|(id, addr)| json!({ "peer_id": id.to_string(), "addr": addr })).collect();
+    Json(json!({ "ok": true, "count": peers.len(), "peers": peers }))
 }

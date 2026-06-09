@@ -24,6 +24,14 @@ const ANNOUNCE_TOPIC: &str = "csd-content/announce/v1";
 const MAX_TRACKED_HASHES: usize = 100_000;
 const MAX_PEERS_PER_HASH: usize = 64;
 
+/// Live view of currently-connected peers (PeerId → remote multiaddr), shared with the gateway
+/// so operators can SEE who's connected (GET /health p2p_peers, GET /p2p). Updated by the p2p
+/// task on connect/disconnect.
+pub type PeerStatus = std::sync::Arc<tokio::sync::RwLock<HashMap<PeerId, String>>>;
+pub fn new_peer_status() -> PeerStatus {
+    std::sync::Arc::new(tokio::sync::RwLock::new(HashMap::new()))
+}
+
 /// Load a persisted ed25519 keypair (so our PeerId is STABLE across restarts), or generate one
 /// and save it. Without this the node draws a fresh random identity each start — which breaks
 /// bootstrap multiaddrs (`/p2p/<id>`) and stales any `csd:peers` registry announcement that
@@ -68,6 +76,14 @@ fn load_or_create_identity(path: Option<std::path::PathBuf>) -> Result<libp2p::i
     Ok(kp)
 }
 
+/// Read the PeerId of a persisted identity file WITHOUT creating one. Used by the binary to
+/// self-exclude from chain-discovered peer dials and to fill its own csd:peers announcement.
+pub fn peer_id_at(path: &std::path::Path) -> Option<String> {
+    let bytes = std::fs::read(path).ok()?;
+    let kp = libp2p::identity::Keypair::from_protobuf_encoding(&bytes).ok()?;
+    Some(PeerId::from(kp.public()).to_string())
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum Req {
     Have(String),
@@ -79,9 +95,12 @@ pub enum Resp {
     Get(Option<Vec<u8>>),
 }
 
-/// A request from the rest of the node to the p2p task: "try to fetch `hash` from peers".
+/// A request from the rest of the node to the p2p task.
 pub enum Cmd {
+    /// "try to fetch `hash` from peers".
     Want(String, oneshot::Sender<Option<Vec<u8>>>),
+    /// "dial this peer" — used for chain-sourced bootstrap (entry peers read from csd:peers).
+    Dial(Multiaddr),
 }
 
 /// In-flight outbound Get requests: request id → (wanted hash, where to deliver verified bytes).
@@ -143,8 +162,11 @@ pub async fn run(
     mut cmd_rx: mpsc::Receiver<Cmd>,
     mut listen_report: Option<oneshot::Sender<Multiaddr>>,
     identity_path: Option<std::path::PathBuf>,
+    peer_status: PeerStatus,
 ) -> Result<()> {
     let keypair = load_or_create_identity(identity_path)?;
+    let local_peer_id = PeerId::from(keypair.public());
+    tracing::info!(peer_id=%local_peer_id, "p2p local identity (use in csd:peers as /p2p/<this>)");
     let mut swarm = libp2p::SwarmBuilder::with_existing_identity(keypair)
         .with_tokio()
         .with_tcp(
@@ -190,15 +212,24 @@ pub async fn run(
     loop {
         tokio::select! {
             cmd = cmd_rx.recv() => {
-                let Some(Cmd::Want(hash, reply)) = cmd else { break Ok(()); };
-                let h = norm(&hash);
-                let peer = providers.get(&h).and_then(|s| s.iter().next().copied());
-                match peer {
-                    Some(p) => {
-                        let rid = swarm.behaviour_mut().rr.send_request(&p, Req::Get(format!("0x{h}")));
-                        pending.insert(rid, (h, reply));
+                match cmd {
+                    Some(Cmd::Want(hash, reply)) => {
+                        let h = norm(&hash);
+                        let peer = providers.get(&h).and_then(|s| s.iter().next().copied());
+                        match peer {
+                            Some(p) => {
+                                let rid = swarm.behaviour_mut().rr.send_request(&p, Req::Get(format!("0x{h}")));
+                                pending.insert(rid, (h, reply));
+                            }
+                            None => { let _ = reply.send(None); } // no known provider yet; caller retries next poll
+                        }
                     }
-                    None => { let _ = reply.send(None); } // no known provider yet; caller retries next poll
+                    // chain-sourced bootstrap: dial an entry peer discovered from csd:peers. Dialing
+                    // an already-connected/self peer is a cheap no-op, so periodic re-dials are safe.
+                    Some(Cmd::Dial(addr)) => {
+                        if let Err(e) = swarm.dial(addr.clone()) { tracing::debug!("chain-peer dial {addr} failed: {e}"); }
+                    }
+                    None => break Ok(()),
                 }
             }
             _ = announce.tick() => {
@@ -210,10 +241,19 @@ pub async fn run(
                     tracing::info!("p2p listening on {address}");
                     if let Some(tx) = listen_report.take() { let _ = tx.send(address); }
                 }
-                // a new peer connected → announce what we hold right away (don't wait for the tick)
-                SwarmEvent::ConnectionEstablished { .. } => {
+                // a new peer connected → record it (monitoring) + announce what we hold right away
+                SwarmEvent::ConnectionEstablished { peer_id, endpoint, .. } => {
+                    peer_status.write().await.insert(peer_id, endpoint.get_remote_address().to_string());
+                    tracing::info!(%peer_id, addr=%endpoint.get_remote_address(), "peer connected");
                     let held = store.list().await;
                     publish_held(&mut swarm, &topic, &held);
+                }
+                SwarmEvent::ConnectionClosed { peer_id, num_established, .. } => {
+                    // only forget the peer when its LAST connection closes
+                    if num_established == 0 {
+                        peer_status.write().await.remove(&peer_id);
+                        tracing::info!(%peer_id, "peer disconnected");
+                    }
                 }
                 SwarmEvent::Behaviour(BehaviourEvent::Gossipsub(gossipsub::Event::Message { message, .. })) => {
                     if let Some(src) = message.source {
