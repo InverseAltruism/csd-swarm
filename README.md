@@ -50,17 +50,30 @@ CSD_SWARM_STORE=./swarm-store \
 | `CSD_ADMIN_TOKEN` | _(off)_ | set a secret to enable the **takedown API**; unset = you cannot remove content over HTTP |
 | `CSD_FOLLOW_URI_HINTS` | `0` | follow attacker-supplied on-chain "hint" URLs (off by default - keeps your IP private) |
 | `CSD_GATEWAY_MAX_CONNS` | `64` | max concurrent content reads (RAM/IO abuse guard) |
-| `CSD_P2P_LISTEN` | `/ip4/0.0.0.0/tcp/0` | peer-to-peer listen address |
-| `CSD_P2P_BOOTSTRAP` | _(none)_ | a peer to connect to (so content replicates between you) |
+| `CSD_P2P_LISTEN` | `/ip4/0.0.0.0/tcp/0` | peer-to-peer listen address (use a fixed port, e.g. `/ip4/0.0.0.0/tcp/8792`, to be reachable) |
+| `CSD_P2P_BOOTSTRAP` | _(none)_ | optional explicit peer(s) to dial (comma-separated multiaddrs) |
+| `CSD_INDEXER` | _(none)_ | an L2 indexer URL — the node reads ENTRY PEERS from the on-chain `csd:peers` registry here and dials them |
 
-To replicate with another node, point your `CSD_P2P_BOOTSTRAP` at its peer address. The node keeps
-a **stable identity** across restarts (a key saved in the store dir), so others can keep finding you.
+### Joining the mesh — no hardcoded server
+
+You do **not** point your node at one server. Like the CSD chain node (which uses a bootnode list),
+the swarm discovers entry peers from the **on-chain `csd:peers` registry** — the chain *is* the
+decentralized, permissionless bootnode list. Set `CSD_INDEXER` to any L2 indexer (e.g.
+`https://cairn-substrate.com/explorer/api`) and on startup the node reads the registered peers and
+dials a few; from there gossipsub meshes you with the rest. The node keeps a **stable identity**
+across restarts (a key saved in the store dir).
+
+To become discoverable yourself, **announce your node on-chain** (one Propose to `csd:peers` with your
+PeerId + public multiaddr) — see `examples/register-swarm-peer.mjs` in the cairn-sdk. You then become
+one more permissionless entry point; no single host is load-bearing. (`CSD_P2P_BOOTSTRAP` still works
+for a private/explicit peer.)
 
 ### What it serves
 - `GET /content/0x<hash>` (and `HEAD`) - the bytes for that hash; the body always matches the hash,
   cached as immutable, served as a non-renderable download, with HTTP range support.
 - `GET /pins` - what this node is holding.
-- `GET /health` - count, total size, store budget, denylist size.
+- `GET /health` - count, total size, store budget, denylist size, **`p2p_peers`** (live connected count).
+- `GET /p2p` - **monitoring**: the currently-connected peers (peer_id + remote multiaddr).
 
 ## ⚠️ Running a node means hosting public content - read this
 
