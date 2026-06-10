@@ -8,7 +8,7 @@ use crate::store::Store;
 use anyhow::Result;
 use futures_util::StreamExt;
 use libp2p::{
-    gossipsub, identify, ping, request_response,
+    connection_limits, gossipsub, identify, ping, request_response,
     request_response::ProtocolSupport,
     swarm::{NetworkBehaviour, SwarmEvent},
     Multiaddr, PeerId, StreamProtocol,
@@ -23,6 +23,17 @@ const ANNOUNCE_TOPIC: &str = "csd-content/announce/v1";
 // Bounds on the gossip-fed providers map (anti-DoS; a peer can't grow it without limit).
 const MAX_TRACKED_HASHES: usize = 100_000;
 const MAX_PEERS_PER_HASH: usize = 64;
+
+// Anti connection-flood caps on the PUBLIC p2p socket (:8792). Without these, a peer (or the whole
+// internet) can open unbounded TCP connections and exhaust our file descriptors / memory — a
+// restartable DoS. These ceilings are generous vs. the real swarm size (a handful of peers) but
+// hard-cap abuse. Enforced by libp2p's connection_limits behaviour BEFORE handlers are allocated.
+const MAX_PENDING_INCOMING: u32 = 32; // half-open inbound handshakes (SYN/noise flood)
+const MAX_PENDING_OUTGOING: u32 = 32;
+const MAX_ESTABLISHED_PER_PEER: u32 = 4; // one peer can't hog all the slots
+const MAX_ESTABLISHED_INCOMING: u32 = 256;
+const MAX_ESTABLISHED_OUTGOING: u32 = 128;
+const MAX_ESTABLISHED_TOTAL: u32 = 384;
 
 /// Live view of currently-connected peers (PeerId → remote multiaddr), shared with the gateway
 /// so operators can SEE who's connected (GET /health p2p_peers, GET /p2p). Updated by the p2p
@@ -109,6 +120,8 @@ type Pending =
 
 #[derive(NetworkBehaviour)]
 struct Behaviour {
+    // FIRST so connection limits are checked before any other behaviour allocates a handler.
+    connection_limits: connection_limits::Behaviour,
     rr: request_response::cbor::Behaviour<Req, Resp>,
     gossipsub: gossipsub::Behaviour,
     identify: identify::Behaviour,
@@ -186,7 +199,17 @@ pub async fn run(
             );
             let identify =
                 identify::Behaviour::new(identify::Config::new(PROTO.into(), key.public()));
+            let connection_limits = connection_limits::Behaviour::new(
+                connection_limits::ConnectionLimits::default()
+                    .with_max_pending_incoming(Some(MAX_PENDING_INCOMING))
+                    .with_max_pending_outgoing(Some(MAX_PENDING_OUTGOING))
+                    .with_max_established_per_peer(Some(MAX_ESTABLISHED_PER_PEER))
+                    .with_max_established_incoming(Some(MAX_ESTABLISHED_INCOMING))
+                    .with_max_established_outgoing(Some(MAX_ESTABLISHED_OUTGOING))
+                    .with_max_established(Some(MAX_ESTABLISHED_TOTAL)),
+            );
             Ok(Behaviour {
+                connection_limits,
                 rr,
                 gossipsub,
                 identify,
@@ -195,6 +218,13 @@ pub async fn run(
         })?
         .with_swarm_config(|c| c.with_idle_connection_timeout(Duration::from_secs(120)))
         .build();
+    tracing::info!(
+        max_established = MAX_ESTABLISHED_TOTAL,
+        max_incoming = MAX_ESTABLISHED_INCOMING,
+        per_peer = MAX_ESTABLISHED_PER_PEER,
+        pending_incoming = MAX_PENDING_INCOMING,
+        "p2p connection limits active (anti connection-flood DoS)"
+    );
 
     let topic = gossipsub::IdentTopic::new(ANNOUNCE_TOPIC);
     swarm.behaviour_mut().gossipsub.subscribe(&topic)?;
