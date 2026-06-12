@@ -436,7 +436,9 @@ name = "csd-swarm"
 version = "0.1.2"
 dependencies = [
  "anyhow",
+ "async-trait",
  "axum",
+ "cbor4ii",
  "futures-util",
  "hex",
  "libp2p",

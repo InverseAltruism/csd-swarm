@@ -7,6 +7,7 @@ use crate::acquire::sha256_hex;
 use crate::store::Store;
 use anyhow::Result;
 use futures_util::StreamExt;
+use libp2p::futures::{AsyncRead, AsyncReadExt as _, AsyncWrite, AsyncWriteExt as _};
 use libp2p::{
     connection_limits, gossipsub, identify, ping, request_response,
     request_response::ProtocolSupport,
@@ -34,6 +35,11 @@ const MAX_ESTABLISHED_PER_PEER: u32 = 4; // one peer can't hog all the slots
 const MAX_ESTABLISHED_INCOMING: u32 = 256;
 const MAX_ESTABLISHED_OUTGOING: u32 = 128;
 const MAX_ESTABLISHED_TOTAL: u32 = 384;
+
+// Max p2p `Get` serves in flight at once (M11 — mirrors the HTTP gateway's read semaphore). Each
+// serve buffers up to one max-object from disk, so peak serve memory ≈ this × CSD_MAX_OBJECT.
+// Past the budget a Get is answered `None` cheaply (the peer treats it as not-held and moves on).
+const MAX_CONCURRENT_SERVES: usize = 16;
 
 /// Live view of currently-connected peers (PeerId → remote multiaddr), shared with the gateway
 /// so operators can SEE who's connected (GET /health p2p_peers, GET /p2p). Updated by the p2p
@@ -106,6 +112,78 @@ pub enum Resp {
     Get(Option<Vec<u8>>),
 }
 
+// Transport ceilings for the request-response codec. Requests are tiny (a Have/Get of one hash);
+// a response carries at most one object, so its ceiling is CSD_MAX_OBJECT plus slack for the cbor
+// envelope (enum tag + byte-string header) — NOT the stock codec's 10 MiB.
+const P2P_MAX_REQUEST: u64 = 64 * 1024;
+const P2P_RESPONSE_SLACK: u64 = 64 * 1024;
+
+/// cbor codec with an EXPLICIT response-size ceiling tied to `CSD_MAX_OBJECT` (L11). The stock
+/// `request_response::cbor` codec hard-codes `RESPONSE_SIZE_MAXIMUM = 10 MiB`, so a lying peer
+/// could make us buffer 5x more than the 2 MiB object cap before `accept_get()` even ran. This
+/// codec is wire-compatible with the stock one (same cbor4ii serde encoding, same EOF framing) —
+/// only the read ceilings differ.
+#[derive(Clone)]
+struct CappedCbor {
+    /// max bytes read for one response = CSD_MAX_OBJECT + P2P_RESPONSE_SLACK
+    max_response: u64,
+}
+
+#[async_trait::async_trait]
+impl request_response::Codec for CappedCbor {
+    type Protocol = StreamProtocol;
+    type Request = Req;
+    type Response = Resp;
+
+    async fn read_request<T>(&mut self, _: &StreamProtocol, io: &mut T) -> std::io::Result<Req>
+    where
+        T: AsyncRead + Unpin + Send,
+    {
+        let mut vec = Vec::new();
+        io.take(P2P_MAX_REQUEST).read_to_end(&mut vec).await?;
+        cbor4ii::serde::from_slice(vec.as_slice())
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, format!("{e:?}")))
+    }
+
+    async fn read_response<T>(&mut self, _: &StreamProtocol, io: &mut T) -> std::io::Result<Resp>
+    where
+        T: AsyncRead + Unpin + Send,
+    {
+        let mut vec = Vec::new();
+        io.take(self.max_response).read_to_end(&mut vec).await?;
+        cbor4ii::serde::from_slice(vec.as_slice())
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, format!("{e:?}")))
+    }
+
+    async fn write_request<T>(
+        &mut self,
+        _: &StreamProtocol,
+        io: &mut T,
+        req: Req,
+    ) -> std::io::Result<()>
+    where
+        T: AsyncWrite + Unpin + Send,
+    {
+        let data = cbor4ii::serde::to_vec(Vec::new(), &req)
+            .map_err(|e| std::io::Error::other(format!("{e:?}")))?;
+        io.write_all(&data).await
+    }
+
+    async fn write_response<T>(
+        &mut self,
+        _: &StreamProtocol,
+        io: &mut T,
+        resp: Resp,
+    ) -> std::io::Result<()>
+    where
+        T: AsyncWrite + Unpin + Send,
+    {
+        let data = cbor4ii::serde::to_vec(Vec::new(), &resp)
+            .map_err(|e| std::io::Error::other(format!("{e:?}")))?;
+        io.write_all(&data).await
+    }
+}
+
 /// A request from the rest of the node to the p2p task.
 pub enum Cmd {
     /// "try to fetch `hash` from peers".
@@ -122,7 +200,7 @@ type Pending =
 struct Behaviour {
     // FIRST so connection limits are checked before any other behaviour allocates a handler.
     connection_limits: connection_limits::Behaviour,
-    rr: request_response::cbor::Behaviour<Req, Resp>,
+    rr: request_response::Behaviour<CappedCbor>,
     gossipsub: gossipsub::Behaviour,
     identify: identify::Behaviour,
     ping: ping::Behaviour,
@@ -135,6 +213,8 @@ fn norm(hash: &str) -> String {
 /// The anti-poisoning gate for peer-served bytes: accept a Get response ONLY if it carries bytes
 /// that are within the size cap AND whose sha256 equals the hash we asked for. A peer that lies
 /// (wrong bytes, oversized, or doesn't actually hold it) gets rejected — it can never poison us.
+/// (The wire is capped too: `CappedCbor` stops reading a response past CSD_MAX_OBJECT + slack,
+/// so an oversized body never gets buffered up to the stock codec's 10 MiB before this check.)
 pub fn accept_get(want_hash: &str, resp: Resp, max_bytes: usize) -> Option<Vec<u8>> {
     let want = norm(want_hash);
     match resp {
@@ -193,7 +273,10 @@ pub async fn run(
                 gossipsub::Config::default(),
             )
             .map_err(|e| std::io::Error::other(e.to_string()))?;
-            let rr = request_response::cbor::Behaviour::<Req, Resp>::new(
+            // explicit codec ceilings: a response can never make us buffer past the object cap
+            // (+ envelope slack) — the stock cbor codec would have allowed 10 MiB (L11)
+            let rr = request_response::Behaviour::with_codec(
+                CappedCbor { max_response: max_bytes as u64 + P2P_RESPONSE_SLACK },
                 [(StreamProtocol::new(PROTO), ProtocolSupport::Full)],
                 request_response::Config::default(),
             );
@@ -239,6 +322,14 @@ pub async fn run(
     let mut pending: Pending = HashMap::new();
     let mut announce = tokio::time::interval(Duration::from_secs(20));
 
+    // M11: bound concurrent p2p Get serves AND do the disk read in a spawned task, so an
+    // unauthenticated Get flood can never monopolize this select! loop (which also drives
+    // gossip/dials/replication). Finished reads come back through `serve_rx` to be answered
+    // here — send_response needs `&mut swarm`, which only this task holds.
+    let serve_permits = std::sync::Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_SERVES));
+    let (serve_tx, mut serve_rx) =
+        mpsc::channel::<(request_response::ResponseChannel<Resp>, Resp)>(MAX_CONCURRENT_SERVES);
+
     loop {
         tokio::select! {
             cmd = cmd_rx.recv() => {
@@ -265,6 +356,11 @@ pub async fn run(
             _ = announce.tick() => {
                 let held = store.list().await;
                 publish_held(&mut swarm, &topic, &held);
+            }
+            // a spawned Get serve finished → answer it (M11; serve_tx lives in this scope, so
+            // recv() never yields None while the loop runs)
+            Some((channel, resp)) = serve_rx.recv() => {
+                let _ = swarm.behaviour_mut().rr.send_response(channel, resp);
             }
             event = swarm.select_next_some() => match event {
                 SwarmEvent::NewListenAddr { address, .. } => {
@@ -302,27 +398,34 @@ pub async fn run(
                     }
                 }
                 SwarmEvent::Behaviour(BehaviourEvent::Rr(request_response::Event::Message { message, .. })) => match message {
-                    request_response::Message::Request { request, channel, .. } => {
-                        let resp = match request {
-                            Req::Have(h) => { let n = norm(&h); let has = !store.is_denied(&n).await && store.has(&n).await.is_some(); Resp::Have { has, len: if has { store.has(&n).await.unwrap_or(0) } else { 0 } } }
-                            // serve only bytes we hold, that aren't on the operator denylist, AND
-                            // re-verify sha256==hash — so a takedown also stops peer replication and
-                            // a locally-tampered blob can't be propagated.
-                            Req::Get(h) => {
-                                let n = norm(&h);
-                                let ok = if store.is_denied(&n).await {
-                                    None
-                                } else {
-                                    match store.get(&n).await {
-                                        Some(b) if crate::acquire::sha256_hex(&b) == n => Some(b),
-                                        _ => None,
-                                    }
-                                };
-                                Resp::Get(ok)
+                    request_response::Message::Request { request, channel, .. } => match request {
+                        Req::Have(h) => {
+                            let n = norm(&h);
+                            let has = !store.is_denied(&n).await && store.has(&n).await.is_some();
+                            let len = if has { store.has(&n).await.unwrap_or(0) } else { 0 };
+                            let _ = swarm.behaviour_mut().rr.send_response(channel, Resp::Have { has, len });
+                        }
+                        // serve only bytes we hold that aren't on the operator denylist — so a
+                        // takedown also stops peer replication. The store holds ONLY verified bytes
+                        // (sha256 checked before every put; see store.rs), so no per-Get recompute.
+                        // Bounded + off-loop (M11): past the permit budget a Get is refused with
+                        // None instead of queueing disk reads on the event loop.
+                        Req::Get(h) => {
+                            let n = norm(&h);
+                            match serve_permits.clone().try_acquire_owned() {
+                                Ok(permit) => {
+                                    let store = store.clone();
+                                    let tx = serve_tx.clone();
+                                    tokio::spawn(async move {
+                                        let body = if store.is_denied(&n).await { None } else { store.get(&n).await };
+                                        let _ = tx.send((channel, Resp::Get(body))).await;
+                                        drop(permit); // released only after the response is handed back
+                                    });
+                                }
+                                Err(_) => { let _ = swarm.behaviour_mut().rr.send_response(channel, Resp::Get(None)); }
                             }
-                        };
-                        let _ = swarm.behaviour_mut().rr.send_response(channel, resp);
-                    }
+                        }
+                    },
                     request_response::Message::Response { request_id, response } => {
                         if let Some((want, reply)) = pending.remove(&request_id) {
                             let _ = reply.send(accept_get(&want, response, max_bytes));

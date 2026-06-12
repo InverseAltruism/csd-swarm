@@ -23,6 +23,9 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 futures-util = "0.3"
 libp2p = { version = "0.54", features = ["tokio", "tcp", "noise", "yamux", "gossipsub", "request-response", "cbor", "identify", "ping", "macros"] }
+# for the capped request-response codec in p2p.rs (same encoding as libp2p's stock cbor codec)
+async-trait = "0.1"
+cbor4ii = { version = "0.3", features = ["serde1", "use_std"] }
 
 [profile.release]
 opt-level = 2
