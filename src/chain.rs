@@ -28,6 +28,10 @@ struct DomainItem {
 #[derive(Deserialize)]
 struct ProposalsResp {
     proposals: Vec<ProposalItem>,
+    /// Total matches before offset/limit — present on nodes with /proposals
+    /// pagination (?offset=). Absent = old node, only the first page exists.
+    #[serde(default)]
+    total: Option<u64>,
 }
 #[derive(Deserialize)]
 struct ProposalItem {
@@ -84,26 +88,51 @@ impl Chain {
         // head-of-line block the whole pass (E1). A per-domain failure yields an empty list (logged),
         // not a fatal error — a partial RPC blip just shrinks this pass and recovers next poll.
         let fetched: Vec<Vec<ProposalItem>> = stream::iter(domains.into_iter().map(|d| async move {
-            let path = format!("/proposals/{}/{}", urlencode(&d.domain), per_domain);
-            match self.get::<ProposalsResp>(&path).await {
-                Ok(p) => {
-                    // Loud, NOT silent, truncation: a full page means the domain may hold more than we
-                    // can see (the node caps /proposals at 500 with no offset).
-                    if p.proposals.len() as u32 >= per_domain {
-                        tracing::warn!(
-                            "domain {} returned {} proposals (>= per_domain cap {}): some may be unlisted — node /proposals is capped with no offset; full coverage needs a node pagination param or block-scan ingest",
-                            d.domain,
-                            p.proposals.len(),
-                            per_domain
-                        );
+            // Page through the node's /proposals with ?offset= (E1). Offset-paging over a
+            // newest-first feed can duplicate across a tip change but never skip (new
+            // proposals only push existing ones deeper); dedup happens by payload_hash below.
+            let mut all: Vec<ProposalItem> = Vec::new();
+            let mut offset: u64 = 0;
+            // hard bound so a misbehaving node can't loop us forever (200 pages = 100k proposals)
+            const MAX_PAGES: u32 = 200;
+            for _ in 0..MAX_PAGES {
+                let path = format!(
+                    "/proposals/{}/{}?offset={}",
+                    urlencode(&d.domain),
+                    per_domain,
+                    offset
+                );
+                match self.get::<ProposalsResp>(&path).await {
+                    Ok(p) => {
+                        let got = p.proposals.len() as u64;
+                        all.extend(p.proposals);
+                        if got < per_domain as u64 {
+                            break; // short page = done
+                        }
+                        if p.total.is_none() {
+                            // Old node: no pagination — ?offset is ignored and every "page" would
+                            // be the same first 500. Keep the loud truncation warning and stop.
+                            tracing::warn!(
+                                "domain {} returned a full page ({}) and the node has no /proposals pagination (no `total` field): some proposals may be unlisted — upgrade the node for ?offset= support",
+                                d.domain,
+                                got
+                            );
+                            break;
+                        }
+                        offset += got;
+                        if let Some(t) = p.total {
+                            if offset >= t {
+                                break;
+                            }
+                        }
                     }
-                    p.proposals
-                }
-                Err(e) => {
-                    tracing::warn!("list {} failed: {e}", d.domain);
-                    Vec::new()
+                    Err(e) => {
+                        tracing::warn!("list {} (offset {}) failed: {e}", d.domain, offset);
+                        break;
+                    }
                 }
             }
+            all
         }))
         .buffer_unordered(8)
         .collect()

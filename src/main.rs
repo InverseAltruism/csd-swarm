@@ -52,10 +52,10 @@ async fn main() -> anyhow::Result<()> {
         .parse()
         .unwrap_or(2 * 1024 * 1024);
     let confirmations: u64 = env("CSD_CONFIRMATIONS", "3").parse().unwrap_or(3);
-    // Proposals requested per domain. The node's /proposals/:domain/:n is hard-capped at 500 with no
-    // offset, so 500 captures everything that endpoint can serve; confirmed_pins logs loudly if a
-    // domain hits the cap (some proposals would then be unreachable — needs a node pagination param or
-    // a block-scan ingest, tracked as a follow-up). (E1)
+    // Proposals requested PER PAGE per domain (the node caps a page at 500). confirmed_pins
+    // pages through ?offset= until a short page, so a domain with >500 proposals is fully
+    // covered on a pagination-capable node; against an old node (no `total` in the response)
+    // it keeps the loud single-page truncation warning. (E1)
     let per_domain: u32 = env("CSD_PER_DOMAIN", "500").parse().unwrap_or(500);
     let poll = Duration::from_secs(env("CSD_POLL_SECS", "30").parse().unwrap_or(30));
     // total-store disk-fill guard (default 10 GiB; 0 = unlimited)
