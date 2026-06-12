@@ -1,3 +1,25 @@
+# rust build & local store
 /target
 /swarm-store
+
+# node deps (relayer/tooling)
+node_modules/
+dist/
+
+# secrets & runtime — NEVER commit keys, env, tokens, or logs
 .npmrc
+.env
+.env.*
+*.log
+**/*key*.json
+**/keystore*.json
+**/*.priv
+**/*.pem
+mnemonic*
+secret*
+
+# OS / editor cruft
+.DS_Store
+.idea/
+.vscode/
+.claude/
