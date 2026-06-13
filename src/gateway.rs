@@ -295,6 +295,9 @@ async fn health(State(st): State<GwState>) -> impl IntoResponse {
 /// operator SEE who's connected to the mesh in real time.
 async fn p2p_peers(State(st): State<GwState>) -> impl IntoResponse {
     let map = st.peers.read().await;
-    let peers: Vec<_> = map.iter().map(|(id, addr)| json!({ "peer_id": id.to_string(), "addr": addr })).collect();
+    let peers: Vec<_> = map
+        .iter()
+        .map(|(id, addr)| json!({ "peer_id": id.to_string(), "addr": addr }))
+        .collect();
     Json(json!({ "ok": true, "count": peers.len(), "peers": peers }))
 }

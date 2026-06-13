@@ -36,6 +36,22 @@ fn is_valid_hash(h: &str) -> bool {
     h.len() == 64 && h.bytes().all(|b| b.is_ascii_hexdigit())
 }
 
+/// Atomically rewrite the denylist file from the in-memory set (tmp + rename). The caller MUST hold
+/// the `denied` write lock for the whole insert/remove + write, so deny()/allow() can never
+/// interleave such that one's atomic rename clobbers the other's update and silently loses a
+/// takedown (the previous append-then-separate-rename design had exactly that race).
+async fn write_denylist(path: &Path, set: &HashSet<String>) -> Result<()> {
+    let body: String = set.iter().map(|x| format!("{x}\n")).collect();
+    let tmp = path.with_file_name("denylist.txt.tmp");
+    tokio::fs::write(&tmp, body)
+        .await
+        .context("write denylist tmp")?;
+    tokio::fs::rename(&tmp, path)
+        .await
+        .context("rename denylist into place")?; // atomic
+    Ok(())
+}
+
 impl Store {
     pub async fn open(dir: impl AsRef<Path>) -> Result<Self> {
         let dir = dir.as_ref().to_path_buf();
@@ -165,17 +181,17 @@ impl Store {
         if !is_valid_hash(&h) {
             anyhow::bail!("not a valid content hash");
         }
-        let newly = self.denied.write().await.insert(h.clone());
-        if newly {
-            // append to the denylist file (create if absent)
-            use tokio::io::AsyncWriteExt;
-            let mut f = tokio::fs::OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open(&self.denylist_path)
-                .await
-                .context("open denylist")?;
-            f.write_all(format!("{h}\n").as_bytes()).await?;
+        {
+            // Hold the write lock across BOTH the set insert AND the file write (rewrite-from-set,
+            // not append) so a concurrent allow() can't rename the file out from under us and drop
+            // this takedown. Roll the set back on an I/O error so memory and file stay consistent.
+            let mut set = self.denied.write().await;
+            if set.insert(h.clone()) {
+                if let Err(e) = write_denylist(&self.denylist_path, &set).await {
+                    set.remove(&h);
+                    return Err(e);
+                }
+            }
         }
         Ok(self.purge(&h).await)
     }
@@ -185,21 +201,17 @@ impl Store {
     /// re-allow other banned hashes (C-W4) — the same tmp+rename discipline as `put`.
     pub async fn allow(&self, hash: &str) -> Result<bool> {
         let h = norm(hash);
-        let removed = self.denied.write().await.remove(&h);
-        if removed {
-            let body: String = {
-                let set = self.denied.read().await;
-                set.iter().map(|x| format!("{x}\n")).collect()
-            };
-            let tmp = self.denylist_path.with_file_name("denylist.txt.tmp");
-            tokio::fs::write(&tmp, body)
-                .await
-                .context("write denylist tmp")?;
-            tokio::fs::rename(&tmp, &self.denylist_path)
-                .await
-                .context("rename denylist into place")?; // atomic
+        // Same single-lock discipline as deny(): remove + rewrite under one held write lock, with
+        // rollback on I/O error, so deny()/allow() can't race and lose an entry.
+        let mut set = self.denied.write().await;
+        if set.remove(&h) {
+            if let Err(e) = write_denylist(&self.denylist_path, &set).await {
+                set.insert(h.clone());
+                return Err(e);
+            }
+            return Ok(true);
         }
-        Ok(removed)
+        Ok(false)
     }
 
     pub async fn count(&self) -> usize {
@@ -312,6 +324,47 @@ mod tests {
         assert!(s2.is_denied(&h1).await, "h1 still denied after reopen");
         assert!(!s2.is_denied(&h2).await, "h2 allowed after reopen");
         assert!(s2.is_denied(&h3).await, "h3 still denied after reopen");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_deny_allow_never_loses_a_takedown() {
+        // Regression for the deny()/allow() race: a concurrent allow()'s atomic file rewrite must
+        // never orphan a concurrent deny()'s takedown. Hammer both across threads, then reopen and
+        // assert the PERSISTED denylist exactly matches the final in-memory set (no lost entries).
+        let dir = tempfile::tempdir().unwrap();
+        let s = Store::open(dir.path()).await.unwrap();
+        let hashes: Vec<String> = (0..64u32)
+            .map(|i| crate::acquire::sha256_hex(format!("h{i}").as_bytes()))
+            .collect();
+        let mut tasks = Vec::new();
+        for (i, h) in hashes.iter().cloned().enumerate() {
+            let s = s.clone();
+            tasks.push(tokio::spawn(async move {
+                s.deny(&h).await.unwrap();
+                if i % 2 == 0 {
+                    // even hashes are re-allowed, racing the odd hashes' denies on the shared file
+                    s.allow(&h).await.unwrap();
+                }
+            }));
+        }
+        for t in tasks {
+            t.await.unwrap();
+        }
+        // the PERSISTED denylist (after a fresh reopen) must equal memory: every odd hash denied,
+        // every even hash allowed — no takedown lost to the race.
+        let s2 = Store::open(dir.path()).await.unwrap();
+        for (i, h) in hashes.iter().enumerate() {
+            assert_eq!(
+                s.is_denied(h).await,
+                i % 2 == 1,
+                "in-memory mismatch at {i}"
+            );
+            assert_eq!(
+                s2.is_denied(h).await,
+                i % 2 == 1,
+                "persisted denylist lost/kept the wrong takedown at {i}"
+            );
+        }
     }
 
     #[tokio::test]

@@ -130,13 +130,27 @@ async fn main() -> anyhow::Result<()> {
             .expect("CSD_P2P_LISTEN must be a multiaddr");
         // entry peers = explicit env bootstrap + chain-sourced (csd:peers via the indexer), so a
         // node can join by reading the chain instead of hardcoding any IP.
-        let mut boot: Vec<libp2p::Multiaddr> = bootstrap.iter().filter_map(|s| s.parse().ok()).collect();
+        let mut boot: Vec<libp2p::Multiaddr> =
+            bootstrap.iter().filter_map(|s| s.parse().ok()).collect();
         boot.extend(csd_swarm::peers::discover(&client, &indexer, &self_peer_id).await);
-        tracing::info!(entry_peers = boot.len(), "p2p bootstrap set (env + chain csd:peers)");
+        tracing::info!(
+            entry_peers = boot.len(),
+            "p2p bootstrap set (env + chain csd:peers)"
+        );
         let id_path = identity_path.clone();
         let peer_status = peer_status.clone();
         tokio::spawn(async move {
-            if let Err(e) = p2p::run(store, listen_ma, boot, max_bytes, cmd_rx, None, id_path, peer_status).await
+            if let Err(e) = p2p::run(
+                store,
+                listen_ma,
+                boot,
+                max_bytes,
+                cmd_rx,
+                None,
+                id_path,
+                peer_status,
+            )
+            .await
             {
                 tracing::error!("p2p task exited: {e}");
             }

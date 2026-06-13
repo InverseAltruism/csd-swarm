@@ -247,6 +247,7 @@ fn publish_held(
 
 /// Run the p2p task: listen, dial bootstrap peers, announce held hashes, serve Have/Get, and
 /// satisfy `Want` commands from peers (verifying bytes before returning them).
+#[allow(clippy::too_many_arguments)] // wiring all the loop's collaborators in one place is clearer than a config struct
 pub async fn run(
     store: Store,
     listen: Multiaddr,
@@ -276,7 +277,9 @@ pub async fn run(
             // explicit codec ceilings: a response can never make us buffer past the object cap
             // (+ envelope slack) — the stock cbor codec would have allowed 10 MiB (L11)
             let rr = request_response::Behaviour::with_codec(
-                CappedCbor { max_response: max_bytes as u64 + P2P_RESPONSE_SLACK },
+                CappedCbor {
+                    max_response: max_bytes as u64 + P2P_RESPONSE_SLACK,
+                },
                 [(StreamProtocol::new(PROTO), ProtocolSupport::Full)],
                 request_response::Config::default(),
             );

@@ -53,12 +53,38 @@ fn ip_is_public(ip: std::net::IpAddr) -> bool {
         }
         std::net::IpAddr::V6(a) => {
             let s = a.segments();
-            !(a.is_loopback()
-                || a.is_unspecified()
-                || a.is_multicast()
-                || (s[0] & 0xfe00) == 0xfc00 // ULA fc00::/7
-                || (s[0] & 0xffc0) == 0xfe80 // link-local fe80::/10
-                || a.to_ipv4_mapped().is_some_and(|v4| !ip_is_public(std::net::IpAddr::V4(v4))))
+            // NAT64 64:ff9b::/96 and 6to4 2002::/16 embed an IPv4 address; reject if the embedded v4
+            // is internal (a NAT64/6to4 translator would otherwise reach it). (redteam F2)
+            let embedded_ok = if s[0] == 0x0064
+                && s[1] == 0xff9b
+                && s[2] == 0
+                && s[3] == 0
+                && s[4] == 0
+                && s[5] == 0
+            {
+                ip_is_public(std::net::IpAddr::V4(std::net::Ipv4Addr::new(
+                    (s[6] >> 8) as u8,
+                    (s[6] & 0xff) as u8,
+                    (s[7] >> 8) as u8,
+                    (s[7] & 0xff) as u8,
+                )))
+            } else if s[0] == 0x2002 {
+                ip_is_public(std::net::IpAddr::V4(std::net::Ipv4Addr::new(
+                    (s[1] >> 8) as u8,
+                    (s[1] & 0xff) as u8,
+                    (s[2] >> 8) as u8,
+                    (s[2] & 0xff) as u8,
+                )))
+            } else {
+                true
+            };
+            embedded_ok
+                && !(a.is_loopback()
+                    || a.is_unspecified()
+                    || a.is_multicast()
+                    || (s[0] & 0xfe00) == 0xfc00 // ULA fc00::/7
+                    || (s[0] & 0xffc0) == 0xfe80 // link-local fe80::/10
+                    || a.to_ipv4_mapped().is_some_and(|v4| !ip_is_public(std::net::IpAddr::V4(v4))))
         }
     }
 }
@@ -185,6 +211,11 @@ mod tests {
             "http://100.64.0.1/x",
             "file:///etc/passwd",
             "gopher://x/y",
+            "http://[::ffff:127.0.0.1]/x", // IPv4-mapped loopback
+            "http://[64:ff9b::7f00:1]/x",  // NAT64 64:ff9b::/96 embedding 127.0.0.1 (redteam F2)
+            "http://[64:ff9b::a00:1]/x",   // NAT64 embedding 10.0.0.1
+            "http://[2002:7f00:1::]/x",    // 6to4 2002::/16 embedding 127.0.0.1 (redteam F2)
+            "http://[2002:a9fe:a9fe::]/x", // 6to4 embedding 169.254.169.254 (metadata)
         ] {
             assert!(!host_is_public(bad), "{bad} must be rejected");
             // even with hints ENABLED, an internal uri is never a candidate (SSRF guard)
@@ -195,6 +226,8 @@ mod tests {
             "https://gist.githubusercontent.com/u/raw",
             "https://example.com/c",
             "http://8.8.8.8/x",
+            "http://[64:ff9b::808:808]/x", // NAT64 embedding the PUBLIC 8.8.8.8 — allowed
+            "http://[2002:0808:0808::]/x", // 6to4 embedding the PUBLIC 8.8.8.8 — allowed
         ] {
             assert!(host_is_public(good), "{good} must be allowed");
         }
